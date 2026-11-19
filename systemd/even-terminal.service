@@ -1,0 +1,31 @@
+[Unit]
+Description=Even Terminal server for the Even G2 glasses (optional part of afield)
+After=network-online.target
+Wants=network-online.target
+PartOf=afield.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# In the slice, so glasses turns (one SDK Claude per turn, children of this server) count
+# towards the shared 8 GB cap like every other session.
+Slice=afield.slice
+# PATH: install.sh adds the folders it found claude and even-terminal in (a drop-in, from the config).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+# even_port in the config (install.sh writes a drop-in); afield reads the same value.
+Environment=EVEN_PORT=3456
+# Even Terminal is configured for Tailscale mode, so wait until Tailscale has an IPv4 address.
+ExecStartPre=/bin/sh -c 'command -v tailscale >/dev/null || exit 0; for i in $(seq 1 60); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 2; done; echo "tailscale not ready" >&2; exit 1'
+# Flags checked by `afield doctor`. contract: EVEN-1
+ExecStart=/usr/bin/env even-terminal --port ${EVEN_PORT} --log-file %h/.even-terminal/logs/even-terminal.log --log-level info --claude-allowed-tools Read,Glob,Grep,ToolSearch,WebSearch,WebFetch,TaskOutput,ExitPlanMode,ListMcpResources,ReadMcpResource,Bash,Edit,Write,NotebookEdit,Agent,Skill,TaskStop,Monitor,TodoWrite,TaskUpdate,EnterPlanMode
+# Its startup banner prints the full auth token and a pairing QR code; keep that out of the journal.
+# Everything else is in the --log-file above. Pairing details: even-terminal config
+StandardOutput=null
+StandardError=journal
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=afield.target

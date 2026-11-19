@@ -1,0 +1,19 @@
+[Unit]
+Description=afield supervisor (reconciles RC sessions with tmux windows: reopens, moves in, adopts, retires)
+After=afield.service afield-tmux.service even-terminal.service
+# Even Terminal is optional (install.sh --with-even); After= only orders it when it is installed.
+Wants=afield-tmux.service
+PartOf=afield.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Slice=afield.slice
+# PATH: install.sh adds the folders it found claude and even-terminal in (a drop-in, from the config).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 -I %h/.local/bin/afield supervise
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=afield.target

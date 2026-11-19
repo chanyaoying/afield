@@ -1,0 +1,2369 @@
+#!/usr/bin/env python3
+"""afield: keep Remote Control sessions across restarts and reach them from a terminal.
+
+  afield                      open the tmux view: one window per session
+  afield new [title]          start a new session in its own window (phone title optional)
+  afield open <name|id>       same, focused on one session
+  afield open --revive <id>   same, also for a forgotten or never-tracked session (by id)
+  afield list                 every tracked session and its state
+  afield list --all           also forgotten sessions and untracked recent chats (ids to --revive)
+  afield status [--json]      services, Even Terminal, memory and how many sessions run
+  afield config [key]         the settings in use (~/.config/afield/config.json + defaults)
+  afield config set <key> <value...>
+                              change a setting (checked; applied, or says what applying needs)
+  afield config unset <key>   put a setting back to its default
+  afield config help          every setting, its value and default, and what a change needs
+  afield logs                 follow the supervisor's log (Ctrl-c to stop)
+  afield reopen <name|id>     bring back a closed, failed or dormant session
+  afield reopen --revive <id> same, also for a forgotten or never-tracked session (by id)
+  afield forget <name|id>     stop tracking a session (its transcript stays)
+  afield retire [name|id]     close its window and stop tracking it (with retire_archives on,
+                                 also archive it in the app)
+                                 (no argument: the session you run it from)
+  afield adopt <id>           bring in a session running in another terminal; once it is
+                                 idle it is stopped there and resumed in its own window
+  afield adopt --revive <id>  same; if it is not running anywhere, revive it as above
+  afield doctor               check every Claude Code / Even / tmux / systemd internal afield
+                                 relies on (contract tests; CONTRACTS.md). Options: --e2e (also a
+                                 throwaway session: creates and archives one phone chat),
+                                 --candidate <claude binary> (check a version before switching to it),
+                                 --update-snapshot (accept the current shapes as the new baseline)
+  afield alert test           send a test message to alerts_url (config), where contract
+                                 failures are sent
+  afield --version            print afield's version
+  afield supervise            the loop run by afield-supervisor.service
+
+Every session in ~/afield runs as one interactive Claude in its own window of tmux server
+`-L afield`, session `rc` (afield-tmux.service), started as
+
+    even-terminal claude --resume <uuid> --remote-control
+
+so the same process serves the terminal (the window), the phone (Remote Control) and the
+Even G2 glasses (Even Terminal's wrapper registers it, and the glasses' prompts are typed into
+it). Even Terminal is optional (install.sh --with-even); without it, or while it is down, sessions
+start without the wrapper and go back on it once it is up and they are idle. In tmux:
+Ctrl-b n / p next or previous session, Ctrl-b w to pick from a list, Ctrl-b d to leave.
+Sessions keep running when you leave. Windows are named after the phone's title.
+
+Phone-started sessions begin as headless children of the server. Once such a session is idle,
+the supervisor moves it into a window: it stops the child, appends a `bridge-session` line naming
+the session's existing phone link to the transcript (afield's only transcript write),
+and starts it as above. The phone keeps the same entry and title (tested).
+
+The server runs with --no-create-session-in-dir: a server-owned session gets reattached by
+the server on restart, and that reattach rewrote a converted session's transcript (tested).
+Sessions the earlier version left as `claude --bg` jobs are moved into windows the same way.
+"""
+import fcntl
+import glob
+import hashlib
+import hmac
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid as uuid_mod
+import urllib.request
+from datetime import datetime
+
+VERSION = "0.1.0"
+HOME = os.path.expanduser("~")
+
+# --- config (~/.config/afield/config.json; every key optional, these are the defaults) ------
+CONFIG_PATH = os.environ.get("AFIELD_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "afield", "config.json")
+CONFIG_DEFAULTS = {
+    "served_dir": "~/afield",   # the folder the Remote Control server serves; sessions run here
+    "even_port": 3456,             # Even Terminal's port (install.sh passes it to the unit)
+    "max_open": 6,                 # sessions running at once; each costs roughly 300-500 MB
+    "memory_max_gb": 8,            # hard cap for all sessions together (afield.slice)
+    "defer_above_gb": 5,           # no more reopens once the sessions use this much
+    "idle_seconds": 5,             # idle this long before a session is moved, adopted or relaunched
+    # Off by default: these call Anthropic's undocumented sessions API (beta), which can change.
+    "archive_sync": False,         # archiving a chat in the app retires it here
+    "retire_archives": False,      # `afield retire` also archives the chat in the app
+    "phone_titles": False,         # name windows after the chat's title in the app
+    # Folders whose "trust this folder?" prompt is answered yes. Claude Code never saves trust
+    # for the home folder, so a session there asks on every launch.
+    "auto_trust_dirs": [],
+    # The glasses list only the sessions afield keeps open, under their phone titles, through
+    # `afield even-proxy` in front of Even Terminal. Off: they list every recent transcript.
+    "glasses_only_afield": True,
+    # Where to say that a contract failed (and when they pass again); empty: nowhere. See
+    # "Alerts" in the README. alerts_format: json (POST {source, title, text}, HMAC-signed when
+    # the secret file exists), ntfy (the secret file holds an access token, if any), slack, discord.
+    "alerts_url": "",
+    "alerts_format": "json",
+    "alerts_secret_file": "~/.config/afield/alerts-secret",
+}
+ALERT_FORMATS = ("json", "ntfy", "slack", "discord")
+
+
+# How each setting takes effect after a change: "supervisor" (restart afield-supervisor; running
+# sessions are untouched), "install" (rerun install.sh, which rewrites a systemd drop-in) or
+# "restart" (install.sh, and it only fully applies once the services restart, which restarts
+# every session). `afield config set` restarts the supervisor itself and only tells you the rest.
+CONFIG_HELP = {
+    "served_dir": ("the folder the Remote Control server serves; new sessions run here", "restart"),
+    "even_port": ("Even Terminal's port", "restart"),
+    "max_open": ("sessions the supervisor reopens at once (each ~300-500 MB); new ones are not "
+                 "blocked", "supervisor"),
+    "memory_max_gb": ("hard memory cap for all sessions together (afield.slice; soft at 75%)", "install"),
+    "defer_above_gb": ("no more reopens once the sessions use this much memory", "supervisor"),
+    "idle_seconds": ("idle this long before a session is moved, adopted or relaunched", "supervisor"),
+    "archive_sync": ("archiving a running chat in the app retires it here (unofficial API)", "supervisor"),
+    "phone_titles": ("name windows after the chat's title in the app (unofficial API)", "supervisor"),
+    "retire_archives": ("`afield retire` also archives the chat in the app (unofficial API, your "
+                        "Claude login; at your own risk)", "supervisor"),
+    "auto_trust_dirs": ("folders whose \"trust this folder?\" prompt is answered yes, e.g. ~",
+                        "supervisor"),
+    "glasses_only_afield": ("the glasses list only afield's sessions, under their phone titles",
+                            "restart"),
+    "alerts_url": ("webhook told when a contract fails or passes again; empty: no alerts "
+                   "(test it: afield alert test)", "supervisor"),
+    "alerts_format": ("how alerts_url is called: json (signed if the secret file exists), ntfy, "
+                      "slack or discord", "supervisor"),
+    "alerts_secret_file": ("json: HMAC key the request is signed with; ntfy: access token. "
+                           "Keep it mode 600; never put it in this file", "supervisor"),
+}
+CONFIG_APPLY = {
+    "supervisor": "takes effect when the supervisor restarts (config set does that; sessions keep running)",
+    "install": "takes effect after ./install.sh in the afield repo (sessions keep running)",
+    "restart": "needs ./install.sh, and fully applies only once the services restart, "
+               "which restarts every session",
+}
+INTEGER_KEYS = {"max_open", "even_port"}
+
+
+def config_value_ok(key, value, defaults=CONFIG_DEFAULTS):
+    """Is value an acceptable setting for key (same type as the default; numbers above 0)?"""
+    want = defaults[key]
+    if isinstance(want, bool):
+        return isinstance(value, bool)
+    if isinstance(want, (int, float)):
+        kinds = int if key in INTEGER_KEYS else (int, float)
+        return isinstance(value, kinds) and not isinstance(value, bool) and value > 0
+    if isinstance(want, list):
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
+    if key == "alerts_url":  # plain http only to this machine: the body and signature are not secret-safe
+        return isinstance(value, str) and (value.startswith("https://") or bool(
+            re.match(r"http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/|$)", value)))
+    if key == "alerts_format":
+        return value in ALERT_FORMATS
+    return isinstance(value, type(want)) and value != ""
+
+
+def parse_config_value(key, words, defaults=CONFIG_DEFAULTS):
+    """The value `afield config set <key> <words...>` means, or ValueError saying why not.
+    Booleans: true/false/on/off/yes/no. Lists: each word (or comma-separated part) is an item,
+    or one JSON list; `[]` empties it. Everything else takes exactly one word."""
+    if key not in defaults:
+        raise ValueError(f"no config key {key!r} (known: {', '.join(defaults)})")
+    want = defaults[key]
+    if isinstance(want, list):
+        if len(words) == 1 and words[0].lstrip().startswith("["):
+            try:
+                value = json.loads(words[0])
+            except ValueError:
+                raise ValueError(f"{key}: {words[0]!r} is not a JSON list") from None
+        else:
+            value = [part.strip() for w in words for part in w.split(",") if part.strip()]
+            if not value:
+                raise ValueError(f"{key}: give one or more folders, or [] for none")
+    elif len(words) != 1:
+        raise ValueError(f"{key} takes one value, got {len(words)}")
+    elif isinstance(want, bool):
+        text = words[0].lower()
+        if text not in ("true", "false", "on", "off", "yes", "no"):
+            raise ValueError(f"{key}: {words[0]!r} is not true or false")
+        value = text in ("true", "on", "yes")
+    elif isinstance(want, (int, float)):
+        try:
+            value = int(words[0])
+        except ValueError:
+            try:
+                value = float(words[0])
+            except ValueError:
+                raise ValueError(f"{key}: {words[0]!r} is not a number") from None
+    else:
+        value = words[0]
+    if not config_value_ok(key, value, defaults):
+        if key in INTEGER_KEYS:
+            rule = "a whole number above 0"
+        elif isinstance(want, (int, float)) and not isinstance(want, bool):
+            rule = "a number above 0"
+        else:
+            rule = f"default {want!r}"
+        raise ValueError(f"{key}: {value!r} is not a valid value ({rule})")
+    return value
+
+
+def config_help(config, path, defaults=CONFIG_DEFAULTS, help_=CONFIG_HELP, apply=CONFIG_APPLY):
+    """The text of `afield config help`: how to change settings, then every key."""
+    lines = [
+        f"Settings live in {path} (or $AFIELD_CONFIG); every key is optional.",
+        "",
+        "  afield config               every setting in use (defaults + the file)",
+        "  afield config <key>         one value, for scripts",
+        "  afield config set <key> <value...>",
+        "                              check and save a value; restarts the supervisor when that",
+        "                              is all it needs (sessions keep running), otherwise says",
+        "                              whether ./install.sh or a full restart is needed",
+        "  afield config unset <key>   back to the default (same rules)",
+        "  afield config help          this text",
+        "",
+        "  Values: true/false (or on/off, yes/no); numbers; lists as separate words,",
+        "  comma-separated, or [] for empty. Example: afield config set max_open 10",
+        "",
+        "Keys: current value (default; what a change needs)",
+    ]
+    for key, default in defaults.items():
+        text, how = help_[key]
+        now = json.dumps(masked_url(config.get(key, default)) if key == "alerts_url" else config.get(key, default))
+        lines.append(f"  {key:<20} {now}  (default {json.dumps(default)}; {how})")
+        lines.append(f"  {'':<20} {text}")
+    lines += ["", "What a change needs:"] + [f"  {k:<11} {v}" for k, v in apply.items()]
+    return "\n".join(lines)
+
+
+def load_config(path=None, defaults=CONFIG_DEFAULTS):
+    """(config, problems): the defaults overlaid with the file's values. A missing file is fine;
+    an unreadable one, an unknown key or a value of the wrong type is a problem and is ignored."""
+    config, problems = dict(defaults), []
+    try:
+        with open(path or CONFIG_PATH) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return config, problems
+    except (OSError, ValueError) as err:
+        return config, [f"cannot read {path or CONFIG_PATH}: {err}"]
+    if not isinstance(data, dict):
+        return config, [f"{path or CONFIG_PATH}: expected a JSON object"]
+    for key, value in data.items():
+        if key not in defaults:
+            problems.append(f"unknown key {key!r} (known: {', '.join(defaults)})")
+        elif config_value_ok(key, value, defaults):
+            config[key] = value
+        else:
+            problems.append(f"{key}: {value!r} is not a valid value (default {defaults[key]!r})")
+    return config, problems
+
+
+CONFIG, CONFIG_PROBLEMS = load_config()
+SERVED_DIR = os.environ.get("AFIELD_DIR") or os.path.expanduser(CONFIG["served_dir"]).rstrip("/")
+SESSIONS_DIR = f"{HOME}/.claude/sessions"
+JOBS_DIR = f"{HOME}/.claude/jobs"
+PROJECTS_DIR = f"{HOME}/.claude/projects"
+CREDENTIALS = f"{HOME}/.claude/.credentials.json"
+STATE_DIR = os.environ.get("AFIELD_STATE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "afield")
+REGISTRY = f"{STATE_DIR}/registry.json"
+LOCK = f"{STATE_DIR}/registry.lock"
+
+SERVER_UNIT = os.environ.get("AFIELD_SERVER_UNIT", "afield.service")
+DAEMON_UNIT = "claude-rc-daemon.service"  # earlier version; only migrated away from now
+SLICE = "afield.slice"
+TMUX_UNIT = "afield-tmux.service"
+TMUX = ["tmux", "-L", os.environ.get("AFIELD_TMUX", "afield")]
+TMUX_SESSION = "rc"
+EVEN_PORT = int(CONFIG["even_port"])
+
+# Only these folders' trust prompt is answered (config: auto_trust_dirs). Nowhere else is.
+AUTO_TRUST_DIRS = [os.path.expanduser(d).rstrip("/") or "/" for d in CONFIG["auto_trust_dirs"]]
+
+# Contract alerts (config: alerts_*). The secret never goes in config.json, which `afield config` prints.
+ALERTS_URL = CONFIG["alerts_url"]
+ALERTS_FORMAT = CONFIG["alerts_format"]
+ALERTS_SECRET = os.path.expanduser(CONFIG["alerts_secret_file"])
+ALERTS_STATE = f"{STATE_DIR}/alerts.json"
+ALERT_RETRY_SECONDS = 600  # after a send that failed (offline, webhook down)
+
+TICK_SECONDS = 5
+SERVER_GRACE_SECONDS = 30
+UNTIE_RETRY_SECONDS = 60   # between restarts of the server to untie chats moved out of it
+GHOST_RETRY_SECONDS = 30   # between Esc presses to a window whose phone connection moved
+PHONE_RELAUNCH_SECONDS = 300  # between relaunches of a window that has no phone link
+ENV_SETUP_RETRY_SECONDS = 20  # between answers to the auto mode setup pop-up in one window
+RETRY_SECONDS = 60
+MAX_ATTEMPTS = 3
+LAUNCH_GRACE_SECONDS = 60  # a session that dies this soon after launch failed; it was not closed
+TRUST_CHECK_SECONDS = 120  # windows younger than this are checked for the folder trust prompt
+EVEN_UNIT = "even-terminal.service"  # optional: without it sessions run without the glasses
+EVEN_WAIT_SECONDS = 90  # at boot, wait this long for an installed Even Terminal before starting without it
+# How long a session must be idle before it is moved, adopted or relaunched. Glasses turns
+# register as live processes while they run, so this cannot catch one mid-turn (checked 2026-11-09).
+IDLE_MS = int(CONFIG["idle_seconds"] * 1000)
+TITLE_REFRESH_SECONDS = 600
+ARCHIVE_CHECK_SECONDS = 60  # how often the phone's list is checked for chats you archived
+MAX_OPEN = int(CONFIG["max_open"])
+MEMORY_MAX_BYTES = int(CONFIG["memory_max_gb"] * 1024**3)
+MAX_AGE_SECONDS = 14 * 24 * 3600
+DEFER_ABOVE_BYTES = int(CONFIG["defer_above_gb"] * 1024**3)  # do not reopen more once the slice is this full
+ARCHIVE_SYNC = CONFIG["archive_sync"]
+PHONE_TITLES = CONFIG["phone_titles"]
+RETIRE_ARCHIVES = CONFIG["retire_archives"]
+PROXY_MAX_BODY = 1 << 20    # bytes in one request from the glasses (they send prompts, not files)
+PROXY_MAX_REQUESTS = 64     # at once; the glasses keep a few long requests open
+GLASSES_ONLY_AFIELD = CONFIG["glasses_only_afield"]
+PROXY_UNIT = "afield-even-proxy.service"
+
+
+# --- decisions (pure, covered by test_afield.py) ---------------------------------------
+
+
+def decide(entry, live_uuids, invocations, oom_since_last_tick, now):
+    """Return none, count, closed or reopen for one tracked session."""
+    if entry["state"] != "open" or entry["uuid"] in live_uuids:
+        return "none"
+    if now - entry.get("launched_at", 0) < LAUNCH_GRACE_SECONDS:
+        return "reopen"
+    if entry.get("host") == "tmux" and entry.get("wrapped") and entry.get("even"):
+        if invocations.get("even") is None:
+            # Even Terminal is restarting; its wrapped sessions come back with it. But only for as
+            # long as wrap_now waits: an Even that never comes up must not hold them forever.
+            if invocations.get("even_waiting", invocations.get("even_expected", True)):
+                return "none"
+            return "reopen"  # Even Terminal was removed or disabled: start them without it
+        if invocations["even"] != entry["even"]:
+            return "reopen"
+    if entry.get("host") not in ("server", "tmux"):
+        return "reopen"  # an old background job, or a host that no longer exists
+    current = invocations.get(entry["host"])
+    if current is None:
+        return "none"
+    if entry.get("invocation") != current:
+        return "reopen"
+    if entry.get("absent", 0) < 1:
+        return "count"
+    return "reopen" if oom_since_last_tick else "closed"
+
+
+def launch_command(uuid, wrapped, new=False, title=None):
+    """No --name: the phone keeps the title it already shows for this link.
+    A new session has no link yet, so it is created under this id with the title you gave."""
+    if new:
+        command = ["claude", "--session-id", uuid, "--remote-control"] + ([title] if title else [])  # contract: CLI-1, E2E-1
+    else:
+        command = ["claude", "--resume", uuid, "--remote-control"]  # contract: CLI-1, E2E-2
+    return ["even-terminal"] + command if wrapped else command  # contract: EVEN-1
+
+
+def link_record(bridge_session_id, uuid):
+    """The transcript line that makes a resumed session reuse its existing phone link."""
+    if not bridge_session_id or not bridge_session_id.startswith("session_"):
+        return None
+    return {"type": "bridge-session", "bridgeSessionId": "cse_" + bridge_session_id[len("session_"):],  # contract: TRANS-2
+            "sessionId": uuid}
+
+
+def revive_entry(old, uuid, cwd, link, title):
+    """A closed registry entry for a stopped session that was forgotten or never tracked.
+    Keeps what the old entry knew (name, title, link) and fills the gaps from the transcript."""
+    old = old or {}
+    link = old.get("link") or link
+    name = title or old.get("title") or old.get("name") or uuid[:8]
+    return dict(uuid=uuid, state="closed", cwd=cwd or old.get("cwd"), name=name,
+                **({"title": title or old.get("title")} if (title or old.get("title")) else {}),
+                **({"link": link} if link else {}), absent=0, attempts=0)
+
+
+def should_convert(proc, now_ms, min_idle_ms, handover=False):
+    """handover: you ran `afield adopt` for this session in another terminal."""
+    movable = proc["host"] in ("server", "daemon") or (proc["host"] == "external" and handover)
+    return (movable and proc["status"] == "idle" and proc["has_chat"]
+            and now_ms - (proc["status_at"] or 0) >= min_idle_ms)
+
+
+def should_adopt(t, now, since, tracked, live, min_idle):
+    """t: a transcript summary. Glasses sessions are Agent SDK transcripts from Even Terminal."""
+    # contract: TRANS-3 (glasses chats are Agent SDK transcripts, entrypoint sdk-ts)
+    return (t["entrypoint"] == "sdk-ts" and t["uuid"] not in tracked and t["uuid"] not in live
+            and t["created"] >= since and now - t["mtime"] >= min_idle)
+
+
+def classify(ancestors, panes, cgroup):
+    """ancestors: the pid and its parents; panes: {pane pid: @afield_uuid or ""}."""
+    for pid in ancestors:
+        if pid in panes:
+            return "tmux" if panes[pid] else "external"
+    if SERVER_UNIT in cgroup:  # contract: PROC-1
+        return "server"
+    if DAEMON_UNIT in cgroup:
+        return "daemon"
+    return "external"
+
+
+def windows_to_close(windows):
+    """windows: [(window_id, uuid or "", pane_dead)]. Untagged windows are yours."""
+    kill, seen = [], set()
+    for window_id, uuid, dead in windows:
+        if not uuid:
+            continue
+        if dead or uuid in seen:
+            kill.append(window_id)
+            continue
+        seen.add(uuid)
+    return kill
+
+
+def window_name(entry):
+    return (entry.get("title") or entry.get("name") or entry["uuid"][:8])[:30]
+
+
+def in_scope(cwd, served):
+    return bool(cwd) and os.path.realpath(cwd) == os.path.realpath(served)
+
+
+def duplicates_to_stop(procs, now_ms, min_idle_ms):
+    """Idle server children whose session also has a window.
+
+    One appears when the phone reaches the server instead of the window, e.g. after the window's
+    Remote Control stood down (code 4090). It may be answering you, so it is left to finish; once
+    idle it is stopped and the window relaunched, which takes the phone connection back."""
+    windowed = {p["uuid"] for p in procs if p["host"] in ("tmux", "daemon")}
+    return [p["pid"] for p in procs if p["host"] == "server" and p["uuid"] in windowed
+            and p.get("status") == "idle" and now_ms - (p.get("status_at") or 0) >= min_idle_ms]
+
+
+def tied_to_server(entries, server_invocation, server_children, server_age, grace, procs=None, now=None):
+    """Open window sessions that are still tied to the running server, when it is safe to untie
+    them by restarting it: it hosts no chat, has been up `grace` seconds and, given `procs`
+    ({uuid: window process}), every one of those windows has settled (window_settled).
+
+    A chat started on the phone belongs to the server it was created on. While that server runs,
+    the cloud hands every new phone message for the chat to the server, even after the chat moved
+    into a window. The server then starts a second copy, which takes the phone connection, and
+    the window, told to stand down (code 4090), finishes the reply it was in. Two copies answered
+    and edited files at once (2026-11-15, 7 times in one chat). A chat whose server has restarted
+    is reached in its window: no takeover happened after a restart (19 of 19 since 2026-11-09)."""
+    if not server_invocation or server_children or server_age < grace:
+        return []
+    tied = [e for e in entries if e.get("state") == "open" and e.get("host") == "tmux"
+            and e.get("server_bound") == server_invocation]
+    if procs is not None and not all(window_settled(e, procs.get(e["uuid"]), now) for e in tied):
+        return []  # restarting under a window that is still connecting cut it off (2026-11-17)
+    return tied
+
+
+def window_settled(entry, proc, now):
+    """A window that has been up a minute, holds its phone link and has been idle 5 s. Restarting
+    the server 5 s after a window started, while it took its first phone message, made that
+    window stand down (code 4090) for good (seen 2026-11-17)."""
+    return bool(proc and proc["host"] == "tmux" and proc.get("link") and proc["status"] == "idle"
+                and now * 1000 - (proc.get("status_at") or 0) >= IDLE_MS
+                and now - entry.get("launched_at", 0) >= LAUNCH_GRACE_SECONDS)
+
+
+def phone_lost(entry, proc, now):
+    """A window that once had a phone link and now has none: its Remote Control stood down or
+    dropped. The session file is the reliable sign; the "standing down" notice scrolls off screen
+    as soon as the window answers anything (2026-11-17)."""
+    return bool(entry.get("link") and proc["host"] == "tmux" and not proc.get("link")  # contract: SESS-1
+                and now - entry.get("launched_at", 0) >= LAUNCH_GRACE_SECONDS
+                and now - entry.get("phone_relaunch_at", 0) >= PHONE_RELAUNCH_SECONDS)
+
+
+def ghost_windows(procs):
+    """Windows still working on a reply while a server copy of the same session runs. The server
+    copy has the phone connection, so the window's reply reaches no one but still edits files."""
+    served = {p["uuid"] for p in procs if p["host"] == "server"}
+    return [p for p in procs if p["host"] == "tmux" and p["uuid"] in served and p.get("status") != "idle"]
+
+
+def should_rewrap(entry, proc, even_is_up, now_ms, idle_ms):
+    """A session that started without the glasses only because Even Terminal was down goes back
+    on the wrapper once Even is up and the session is idle. A session started without the wrapper
+    on purpose (the last launch attempt, in case the wrapper is what fails) is left alone."""
+    return (even_is_up and entry.get("rewrap") and entry.get("state") == "open" and proc["host"] == "tmux"
+            and proc["status"] == "idle" and now_ms - (proc["status_at"] or 0) >= idle_ms)
+
+
+def stood_down(screen):
+    """The window's Remote Control gave up its phone connection and has not reconnected."""
+    text = screen.lower()
+    down = text.rfind("standing down")  # contract: SCREEN-1
+    return down >= 0 and down > text.rfind("remote-control is active")
+
+
+ENV_SETUP_TITLE = "Teach auto mode about your environment?"  # contract: SCREEN-2
+ENV_SETUP_OPTIONS = ["1. Yes", "2. Not now", "3. Don't show again"]  # contract: SCREEN-2
+
+
+def env_setup_prompt(screen, tail=16):
+    """Which part of Claude Code's "Teach auto mode about your environment?" pop-up a window is
+    showing at its bottom: "offer" (Yes / Not now / Don't show again), "wizard" (the setup it starts
+    on Yes), or None. While it is open, the Enter the glasses send with a message answers the pop-up
+    and the message is lost (2026-11-19). Only whole lines in the bottom `tail` lines count, so a
+    chat that quotes the title is not mistaken for the pop-up."""
+    lines = [l.strip().lstrip("❯").strip() for l in screen.splitlines() if l.strip()][-tail:]
+    if ENV_SETUP_TITLE not in lines:
+        return None
+    after = lines[len(lines) - lines[::-1].index(ENV_SETUP_TITLE):]
+    if not any(l.endswith("Esc to cancel") for l in after):  # contract: SCREEN-2
+        return None
+    if all(o in after for o in ENV_SETUP_OPTIONS):
+        return "offer"
+    if any(l.startswith("Also scan shell history") for l in after):  # contract: SCREEN-2
+        return "wizard"
+    return None
+
+
+def contract_alert(results, alerted):
+    """What to tell you about the last contract run, given the key of what was last sent:
+    (key, title, text), or None when nothing changed since. Only failures are sent, once each (a
+    new detail counts as new), and the all-clear once they pass. "changed" (still works, differs
+    from the snapshot) stays in the log and `afield status`: the API's optional fields come and
+    go between runs, so alerting on it would be noise."""
+    bad = sorted((r["id"], "; ".join(r.get("detail") or [])) for r in results if r["status"] == "FAIL")
+    key = json.dumps(bad)
+    if key == (alerted or json.dumps([])):
+        return None
+    if not bad:
+        return key, "afield: contracts pass again", "Every contract passes; nothing is paused."
+    title = f"afield: {len(bad)} contract{'s' * (len(bad) != 1)} FAILED"
+    lines = [f"{cid}: {detail[:300]}" for cid, detail in bad]
+    lines.append("Run `afield doctor`; what to do is in CONTRACTS.md under each ID.")
+    return key, title, "\n".join(lines)
+
+
+def parse_show(text):
+    """`systemctl show -p Id -p ...` for several units -> {unit id: {property: value}}."""
+    units = {}
+    for block in text.strip().split("\n\n"):
+        props = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if props.get("Id"):
+            units[props["Id"]] = props
+    return units
+
+
+CAPTURE_SEP = "@@afield-capture@@"
+
+
+def capture_args(window_ids):
+    """One tmux command line that prints every window's screen, separated by CAPTURE_SEP."""
+    args = []
+    for window_id in window_ids:
+        if args:
+            args += [";", "display-message", "-p", CAPTURE_SEP, ";"]
+        args += ["capture-pane", "-p", "-t", window_id]
+    return args
+
+
+def split_captures(window_ids, out):
+    """The screens printed by capture_args, as {window id: screen}."""
+    return dict(zip(window_ids, out.split(CAPTURE_SEP + "\n"))) if window_ids else {}
+
+
+def trust_check_due(entry, now, window=TRUST_CHECK_SECONDS):
+    """The trust prompt only shows while a session starts up, so only new windows are looked at."""
+    return now - entry.get("launched_at", 0) < window
+
+
+def select_reopen(candidates, live_count, limit, now, max_age):
+    fresh = [c for c in candidates if now - c["mtime"] <= max_age]
+    fresh.sort(key=lambda c: c["mtime"], reverse=True)
+    return fresh[: max(0, limit - live_count)]
+
+
+# --- system state --------------------------------------------------------------------------
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def unit_property(unit, prop):
+    out = subprocess.run(
+        ["systemctl", "--user", "show", unit, "-p", prop, "--value"],
+        capture_output=True, text=True,
+    )
+    return out.stdout.strip()
+
+
+def even_instance():
+    """Identity of the running Even Terminal server on EVEN_PORT, or None."""
+    for path in glob.glob(f"{HOME}/.even-terminal/instances/*.json"):  # contract: EVEN-3
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if data.get("port") == EVEN_PORT and pid_is_current(data.get("pid"), None):
+            return f"{data['pid']}:{data.get('startedAt')}"
+    return None
+
+
+def units_show(units, props):
+    """Several properties of several units in one systemctl call (it runs every tick).
+    contract: SYSD-1"""
+    args = ["systemctl", "--user", "show", *units, "-p", "Id"]
+    for prop in props:
+        args += ["-p", prop]
+    return parse_show(subprocess.run(args, capture_output=True, text=True).stdout)
+
+
+def even_expected(props=None):
+    """Even Terminal is installed and meant to run (enabled, or running right now)."""
+    if props is None:
+        props = units_show([EVEN_UNIT], ["UnitFileState", "ActiveState"]).get(EVEN_UNIT, {})
+    return (props.get("UnitFileState") in ("enabled", "linked", "enabled-runtime")
+            or props.get("ActiveState") in ("active", "activating"))
+
+
+def invocations():
+    shown = units_show([SERVER_UNIT, TMUX_UNIT, EVEN_UNIT], ["ActiveState", "InvocationID", "UnitFileState", "NRestarts"])
+
+    def invocation(unit):
+        props = shown.get(unit, {})
+        return (props.get("InvocationID") or None) if props.get("ActiveState") == "active" else None
+    def restarts(unit):
+        count = shown.get(unit, {}).get("NRestarts", "")
+        return int(count) if count.isdigit() else None
+    return {"server": invocation(SERVER_UNIT), "tmux": invocation(TMUX_UNIT), "even": even_instance(),
+            "even_expected": even_expected(shown.get(EVEN_UNIT, {})),
+            "server_restarts": restarts(SERVER_UNIT), "even_restarts": restarts(EVEN_UNIT)}
+
+
+# --- Remote Control server health -------------------------------------------------------------
+# The server is Anthropic's; what afield needs from it is that it stays up, so the phone can
+# start new chats. A crash loop (e.g. "folder already served" after a mode switch) hides behind
+# Restart=always as a unit that looks active, so every automatic restart is recorded here.
+
+SERVER_HEALTH = f"{STATE_DIR}/server-health.json"
+RESTART_WINDOW_SECONDS = 3600
+RESTART_WARN_AT = 3  # automatic restarts within the window that count as a crash loop
+
+
+RESTART_KEYS = {"server": ("restarts", "the Remote Control server"),
+                "even": ("even_restarts", "Even Terminal (the glasses)")}
+
+
+def record_restarts(state, unit, count, now, path=None):
+    """Called every tick with a unit's NRestarts (unit: server or even). Appends one timestamp per
+    new restart to that unit's list in the health file."""
+    if count is None:
+        return
+    key, what = RESTART_KEYS[unit]
+    last = state.get(f"{unit}_restarts")
+    state[f"{unit}_restarts"] = count
+    if last is None or count <= last:  # first look, or the counter reset (unit reloaded)
+        return
+    log(f"{what} restarted on its own ({count - last} more, {count} since it was started)")
+    history = read_server_health(path)
+    history[key] = (history.get(key, []) + [now] * (count - last))[-50:]
+    try:
+        tmp = (path or SERVER_HEALTH) + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(history, fh)
+        os.replace(tmp, path or SERVER_HEALTH)
+    except OSError:
+        pass
+
+
+def record_server_restarts(state, count, now, path=None):
+    record_restarts(state, "server", count, now, path)
+
+
+def record_all_restarts(state, invs, now):
+    record_restarts(state, "server", invs["server_restarts"], now)
+    record_restarts(state, "even", invs.get("even_restarts"), now)
+
+
+def read_server_health(path=None):
+    try:
+        with open(path or SERVER_HEALTH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def server_health(active, restart_times, now, window=RESTART_WINDOW_SECONDS, warn_at=RESTART_WARN_AT):
+    """(ok, words) for `afield status`. active: the unit's ActiveState."""
+    recent = sum(1 for t in restart_times if now - t <= window)
+    if active != "active":
+        return False, f"{active}: the phone cannot start new chats (journalctl --user -u {SERVER_UNIT})"
+    if recent >= warn_at:
+        return False, (f"RESTARTING ({recent} times in the last hour): the phone may not be able to start "
+                       f"new chats (journalctl --user -u {SERVER_UNIT})")
+    return True, f"{active}, {recent} automatic restart{'s' if recent != 1 else ''} in the last hour"
+
+
+def even_health(restart_times, now, window=RESTART_WINDOW_SECONDS, warn_at=RESTART_WARN_AT):
+    """(ok, words) for the glasses line of `afield status`. A crash loop (e.g. even-terminal not on
+    its PATH) looks like a unit that is only ever "activating"; sessions then run without it."""
+    recent = sum(1 for t in restart_times if now - t <= window)
+    if recent >= warn_at:
+        return False, (f"RESTARTING ({recent} times in the last hour): sessions run without the glasses "
+                       f"(journalctl --user -u {EVEN_UNIT})")
+    return True, ""
+
+
+def seconds_since_start(unit):
+    micros = unit_property(unit, "ActiveEnterTimestampMonotonic")
+    if not micros or micros == "0":
+        return 0
+    return time.monotonic() - int(micros) / 1e6
+
+
+_slice_group = None
+
+
+def slice_file(name):
+    """Contents of a file in the slice's cgroup. The path is asked of systemd once, not every tick."""
+    global _slice_group
+    for _ in range(2):
+        if not _slice_group:
+            _slice_group = unit_property(SLICE, "ControlGroup")
+        try:
+            with open(f"/sys/fs/cgroup{_slice_group}/{name}") as fh:
+                return fh.read()
+        except OSError:
+            _slice_group = None  # moved or not created yet: ask again once
+    return ""
+
+
+def working_set(current, stat):
+    """Memory the sessions really hold: memory.current minus the inactive file cache, which the
+    kernel drops first under pressure (the same measure as kubelet's). Old transcripts and binaries
+    read once sit in that cache, often half the slice, and must not block reopens."""
+    for line in stat.splitlines():
+        if line.startswith("inactive_file "):
+            return max(0, current - int(line.split()[1]))
+    return current
+
+
+def slice_memory():
+    value = slice_file("memory.current").strip()  # contract: SYSD-1
+    current = int(value) if value.isdigit() else 0
+    return working_set(current, slice_file("memory.stat"))
+
+
+def oom_kills():
+    """Kernel OOM kills inside the slice since boot."""
+    for line in slice_file("memory.events").splitlines():
+        if line.startswith("oom_kill "):
+            return int(line.split()[1])
+    return 0
+
+
+def even_up():
+    try:
+        with socket.create_connection(("127.0.0.1", EVEN_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def pid_is_current(pid, proc_start):
+    """Session files outlive a kill -9, and PIDs get reused, so compare start times too."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+    except OSError:
+        return False
+    return proc_start in (None, fields[19])  # contract: SESS-2
+
+
+def ancestors(pid, depth=6):
+    chain = []
+    while pid and pid > 1 and len(chain) < depth:
+        chain.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return chain
+
+
+def cgroup_of(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def live_processes(panes):
+    procs = []
+    for path in glob.glob(f"{SESSIONS_DIR}/*.json"):
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not pid_is_current(data.get("pid"), data.get("procStart")):  # contract: SESS-1, BIN-1
+            continue
+        pid = data["pid"]
+        procs.append(dict(
+            pid=pid, uuid=data["sessionId"], cwd=data.get("cwd"), name=data.get("name"),
+            status=data.get("status"), status_at=data.get("statusUpdatedAt"),
+            link=data.get("bridgeSessionId"), host=classify(ancestors(pid), panes, cgroup_of(pid)),
+        ))
+    return procs
+
+
+def transcript_path(cwd, uuid):
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # contract: TRANS-1
+    return f"{PROJECTS_DIR}/{encoded}/{uuid}.jsonl"
+
+
+def locate_transcript(key):
+    """(uuid, cwd, link) for the one transcript whose id starts with key, from any folder."""
+    if not re.fullmatch(r"[0-9a-f-]{4,36}", key):
+        sys.exit(f"afield: --revive needs a session id (at least 4 characters), not '{key}'.")
+    paths = sorted(glob.glob(f"{PROJECTS_DIR}/*/{key}*.jsonl"))
+    uuids = {os.path.basename(p)[:-len(".jsonl")] for p in paths}
+    if len(uuids) != 1:
+        sys.exit(f"afield: '{key}' matched {len(uuids)} transcripts" + (": use more of its id." if uuids else "."))
+    path = paths[0]
+    cwd = None
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"cwd"' in line:
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    break
+    if not cwd or not os.path.isdir(cwd):
+        sys.exit(f"afield: could not tell which folder {key} ran in.")
+    link = last_link_in_transcript(path)
+    return uuids.pop(), cwd, "session_" + link[len("cse_"):] if link and link.startswith("cse_") else None
+
+
+def has_conversation(cwd, uuid):
+    try:
+        with open(transcript_path(cwd, uuid), errors="replace") as fh:
+            return any('"type":"user"' in line for line in fh)  # contract: TRANS-4
+    except OSError:
+        return False
+
+
+def transcript_mtime(cwd, uuid):
+    try:
+        return os.path.getmtime(transcript_path(cwd, uuid))
+    except OSError:
+        return 0
+
+
+def adopt_since():
+    """Glasses sessions created before adoption was switched on stay as they are."""
+    path = f"{STATE_DIR}/adopt-since"
+    try:
+        with open(path) as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        now = time.time()
+        with open(path, "w") as fh:
+            fh.write(str(now))
+        return now
+
+
+def recent_transcripts(max_age=3600):
+    """Summaries of transcripts written in the last hour: uuid, entrypoint, cwd, created, mtime."""
+    now = time.time()
+    found = []
+    for path in glob.glob(f"{PROJECTS_DIR}/*/*.jsonl"):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if now - mtime > max_age:
+            continue
+        try:
+            with open(path, errors="replace") as fh:
+                for _ in range(200):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if '"entrypoint"' not in line:
+                        continue
+                    record = json.loads(line)
+                    stamp = record.get("timestamp", "").replace("Z", "+00:00")
+                    created = datetime.fromisoformat(stamp).timestamp() if stamp else mtime
+                    found.append(dict(uuid=os.path.basename(path)[:-6], entrypoint=record.get("entrypoint"),
+                                      cwd=record.get("cwd"), created=created, mtime=mtime))
+                    break
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def session_of(ancestor_pids, procs):
+    """The session whose Claude process is an ancestor of the caller."""
+    return next((p["uuid"] for p in procs if p["pid"] in ancestor_pids), None)
+
+
+def archived_to_retire(entries, statuses, live, now, grace):
+    """Running sessions the phone lists as archived: you archived them in the app.
+
+    statuses: {link: (status, updated_at)}. A session that is not running is never retired here.
+    Every chat archives itself when the machine shuts down (end_session "archived" right after
+    worker_shutting_down), so while the machine is down every chat already shows as archived and
+    archiving it again in the app changes nothing the supervisor can see (tested 2026-11-08).
+    updated_at is no help: archiving does not change it, a message you send does.
+    Reopening un-archives the chat. A session missing from the list is kept too."""
+    retire = []
+    for e in entries:
+        status, _updated = statuses.get(e.get("link"), (None, None))
+        if (e.get("state") == "open" and e.get("link") and status == "archived" and e["uuid"] in live
+                and now - e.get("launched_at", 0) >= grace):  # just started: its status lags
+            retire.append(e["uuid"])
+    return retire
+
+
+def parse_time(stamp):
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+API_ROOT = "https://api.anthropic.com"
+API_HEADERS = {"anthropic-version": "2023-06-01", "anthropic-beta": "ccr-byoc-2025-07-29"}  # contract: API-1
+
+
+def api_request(path, data=None, timeout=10):
+    """JSON from the claude.ai sessions API, as the Claude app sees it. Raises on any failure;
+    the callers below turn a failure into "unknown" so the supervisor keeps its last known state."""
+    with open(CREDENTIALS) as fh:
+        token = json.load(fh)["claudeAiOauth"]["accessToken"]  # contract: CRED-1
+    headers = dict(API_HEADERS, Authorization=f"Bearer {token}")
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(API_ROOT + path, headers=headers,
+                                     data=None if data is None else json.dumps(data).encode(),
+                                     method="GET" if data is None else "POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read()
+        return json.loads(body) if body.strip() else {}
+
+
+def fetch_statuses():
+    """{phone session id: status} for the phone's session list, or None if it cannot be read."""
+    try:
+        data = api_request("/v1/sessions?limit=100")  # contract: API-1
+        return {s["id"]: (s.get("session_status"), parse_time(s.get("updated_at"))) for s in data["data"]}
+    except Exception:
+        return None
+
+
+def archive_path(link):
+    return "/v1/code/sessions/cse_" + link[len("session_"):] + "/archive"  # contract: E2E-3
+
+
+def archive_link(link):
+    try:
+        api_request(archive_path(link), data={})
+        return True
+    except Exception:
+        return False
+
+
+def fetch_title(link):
+    """The title the phone shows for this session, or None if it cannot be read right now."""
+    try:
+        return api_request("/v1/sessions/" + link, timeout=5).get("title") or None  # contract: API-2
+    except Exception:  # offline, token expired, API change: keep the last known title
+        return None
+
+
+# --- the glasses' session list (afield even-proxy) --------------------------------------------
+# The glasses list sessions with GET /api/sessions on Even Terminal. Even answers with the newest
+# transcripts of every project, each under its transcript title, and a window's --remote-control
+# without a name writes the folder's name as that title ("claude-rc-eb"). So Even listens on
+# 127.0.0.1 only (EVEN_HOST_MODE=interface, lo), and this proxy takes the address the glasses use.
+# It passes their requests on, except that the list holds only the sessions afield keeps open,
+# under their phone titles.  contract: EVEN-4, EVEN-5
+#
+# Even trusts 127.0.0.1 for two things: its hook endpoint (no token at all) and the WebSocket its
+# wrappers connect to. Through the proxy every request comes from 127.0.0.1, so only /api routes
+# are passed on, never claude-sync and never an Upgrade. Every other route checks Even's token.
+
+GLASSES_FETCH = 50  # sessions asked of Even, so afield's are among them however many others exist
+HOP_HEADERS = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te",
+               "trailer", "proxy-authenticate", "proxy-authorization"}
+
+
+def glasses_list_request(path):
+    """GET /api/sessions?...: (the path asked of Even instead, the limit the glasses wanted).
+    Anything else: None."""
+    import urllib.parse
+    parts = urllib.parse.urlsplit(path)
+    if parts.path != "/api/sessions":
+        return None
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    limit = next((int(v) for k, v in query if k == "limit" and v.isdigit()), 0) or 10  # Even's default
+    query = [(k, v) for k, v in query if k != "limit"] + [("limit", str(max(limit, GLASSES_FETCH)))]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query))), limit
+
+
+def glasses_sessions(upstream, registry, limit):
+    """The list the glasses get: the sessions afield keeps open, in Even's order, phone titles."""
+    out = []
+    for session in upstream:
+        entry = registry.get(session.get("id")) if isinstance(session, dict) else None
+        if entry and entry.get("state") == "open":
+            out.append(dict(session, title=(entry.get("title") or entry.get("name") or session.get("title") or "")[:64]))
+    return out[:limit]
+
+
+def glasses_may_forward(path, headers):
+    """Only token-checked /api routes; never Even's loopback-trusted hook or wrapper WebSocket."""
+    import urllib.parse
+    if any(k.lower() == "upgrade" for k in headers):
+        return False
+    route = urllib.parse.unquote(urllib.parse.urlsplit(path).path).lower()
+    if not route.startswith("/api/") or "//" in route or "/.." in route or "claude-sync" in route:
+        return False
+    return True
+
+
+def even_outside_address(network, run=subprocess.run):
+    """The address Even would listen on for the glasses (~/.even-terminal/config.json network)."""
+    mode = (network or {}).get("mode")
+    try:
+        if mode == "tailscale":
+            out = run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout
+            return (out.split() or [None])[0]
+        if mode in ("lan", "interface"):
+            out = run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                fields = line.split()
+                if len(fields) < 4 or fields[2] != "inet":
+                    continue
+                name, address = fields[1], fields[3].split("/")[0]
+                if mode == "interface" and name == network.get("name"):
+                    return address
+                if mode == "lan" and re.match(r"(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", address):
+                    return address
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None  # expose mode (a tunnel provider) is not supported: the glasses then see everything
+
+
+def even_network():
+    try:
+        with open(f"{HOME}/.even-terminal/config.json") as fh:  # contract: EVEN-4
+            return json.load(fh).get("network") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def glasses_proxy(address, port, even_port):
+    """The proxy server (not yet serving): on address:port, passing on to Even on 127.0.0.1:even_port."""
+    import http.client
+    import http.server
+    slots = threading.BoundedSemaphore(PROXY_MAX_REQUESTS)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"  # the reply ends when the connection closes: streams pass as they come
+
+        def log_message(self, *_args):
+            pass
+
+        def forward(self):
+            if not slots.acquire(blocking=False):
+                self.send_error(503, "too many requests at once")
+                return
+            try:
+                self.forward_one()
+            finally:
+                slots.release()
+
+        def forward_one(self):
+            if not glasses_may_forward(self.path, self.headers):
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if not 0 <= length <= PROXY_MAX_BODY:
+                self.send_error(413)
+                return
+            body = self.rfile.read(length) if length else None
+            rewrite = glasses_list_request(self.path) if self.command == "GET" else None
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
+            conn = http.client.HTTPConnection("127.0.0.1", even_port, timeout=3600)
+            try:
+                conn.request(self.command, rewrite[0] if rewrite else self.path, body=body, headers=headers)
+                resp = conn.getresponse()
+                data = None
+                if rewrite and resp.status == 200:
+                    data = resp.read()
+                    try:
+                        doc = json.loads(data)
+                        doc["sessions"] = glasses_sessions(doc.get("sessions") or [], load(), rewrite[1])
+                        data = json.dumps(doc).encode()
+                    except (ValueError, TypeError, AttributeError):
+                        pass  # not the shape we know: pass it on unchanged (EVEN-5 reports it)
+                self.send_response_only(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP_HEADERS and not (data is not None and k.lower() == "content-length"):
+                        self.send_header(k, v)
+                if data is not None:
+                    self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if data is not None:
+                    self.wfile.write(data)
+                    return
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except OSError:
+                try:
+                    self.send_error(502)
+                except OSError:
+                    pass
+            finally:
+                conn.close()
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = forward
+
+    server = http.server.ThreadingHTTPServer((address, port), Handler)
+    server.daemon_threads = True
+    return server
+
+
+def cmd_even_proxy(print_address=False):
+    address = even_outside_address(even_network())
+    if not address:
+        sys.exit("afield: cannot tell which address the glasses use (network in ~/.even-terminal/config.json "
+                 "must be tailscale, lan or interface:<name>)")
+    if print_address:
+        print(address)
+        return
+    server = glasses_proxy(address, EVEN_PORT, EVEN_PORT)
+    log(f"glasses proxy on {address}:{EVEN_PORT} -> Even Terminal on 127.0.0.1:{EVEN_PORT}")
+    server.serve_forever()
+
+
+# --- contracts (lib/afield_contracts.py, CONTRACTS.md) -------------------------------------------
+
+CONTRACTS_STATE = f"{STATE_DIR}/contracts.json"
+_contracts = None
+
+
+def contracts():
+    """The contract-test module, found next to this script in the repo (the script is a symlink)."""
+    global _contracts
+    if _contracts is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "afield_contracts.py")
+        spec = importlib.util.spec_from_file_location("afield_contracts", path)
+        _contracts = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_contracts)
+    return _contracts
+
+
+def saved_contracts():
+    try:
+        with open(CONTRACTS_STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def contracts_paused():
+    """IDs of failed critical contracts from the last check. While any are listed, nothing acts on
+    the assumption that may have broken: no moving or adopting, no archive sync, no link writes."""
+    return (saved_contracts() or {}).get("blocking", [])
+
+
+def check_contracts(levels=("static", "live"), claude=None, log=log):
+    """Runs the contract tests and, for the installed version, records the result for the supervisor."""
+    c = contracts()
+    results, seen = c.run(sys.modules[__name__], levels, claude=claude, log=log)
+    if claude is None:  # a candidate binary is not what runs, so it does not decide the pause
+        tmp = CONTRACTS_STATE + ".tmp"
+        os.makedirs(os.path.dirname(CONTRACTS_STATE), exist_ok=True)  # a fresh install has none yet
+        with open(tmp, "w") as fh:
+            json.dump(dict(fingerprint=c.fingerprint(sys.modules[__name__]), ran_at=time.time(), versions=seen,
+                           levels=list(levels), blocking=c.blocking(results),
+                           results=[dict({k: r[k] for k in ("id", "status", "detail")}, **({"off": True} if r.get("off") else {}))
+                                    for r in results]),
+                      fh, indent=1)
+        os.replace(tmp, CONTRACTS_STATE)
+    return results, seen
+
+
+def supervise_contracts(state):
+    """Checked on start, when claude or even-terminal changes version, and every 6 hours
+    (every 10 minutes while some could not be checked yet, e.g. at boot)."""
+    c = contracts()
+    if not c.is_stale(saved_contracts(), c.fingerprint(sys.modules[__name__]), time.time()):
+        return
+    before = contracts_paused()
+    results, seen = check_contracts()
+    for line in c.format_report(results, seen).splitlines():
+        if not line.startswith(("ok ", "skip ")):
+            log("contracts: " + line)
+    after = contracts_paused()
+    if after and after != before:
+        log(f"contracts failed ({', '.join(after)}): pausing {c.PAUSES}; run afield doctor")
+    elif before and not after:
+        log("contracts pass again: resuming everything")
+
+
+def alert_request(fmt, title, text, secret, now, source):
+    """(body, headers) for one alert in the given format. secret: the secret file's contents or None.
+    json: {source, title, text}; with a secret, X-Timestamp and X-Signature =
+    hex(HMAC-SHA256(secret, "<timestamp>.<body>")), so the receiver can refuse forgeries and replays."""
+    if fmt == "ntfy":
+        headers = {"Title": title, "Tags": "warning"}
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
+        return f"{text}\n\n{source}".encode(), headers
+    if fmt == "slack":
+        return json.dumps({"text": f"*{title}*\n{text}\n_{source}_"}).encode(), {"Content-Type": "application/json"}
+    if fmt == "discord":
+        return (json.dumps({"content": f"**{title}**\n{text}\n*{source}*"[:2000]}).encode(),
+                {"Content-Type": "application/json"})
+    body = json.dumps({"source": source, "title": title, "text": text}).encode()
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        stamp = str(int(now))
+        headers["X-Timestamp"] = stamp
+        headers["X-Signature"] = hmac.new(secret.encode(), stamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+    return body, headers
+
+
+def send_alert(title, text, url=None, fmt=None, secret_path=None, timeout=10):
+    """Send one alert to alerts_url. Raises on any failure, including a non-2xx answer."""
+    path = secret_path or ALERTS_SECRET
+    try:
+        with open(path) as fh:
+            if os.fstat(fh.fileno()).st_mode & 0o077:
+                log(f"warning: {path} can be read by other users; run: chmod 600 {path}")
+            secret = fh.read().strip() or None
+    except FileNotFoundError:
+        secret = None
+    body, headers = alert_request(fmt or ALERTS_FORMAT, title, text, secret, time.time(),
+                                  f"afield on {socket.gethostname()}")
+    request = urllib.request.Request(url or ALERTS_URL, data=body, method="POST", headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status
+
+
+def masked_url(url):
+    """scheme://host/… : webhook paths often are the secret (Slack, Discord), so they are not printed."""
+    m = re.match(r"([a-z]+://[^/]+)(/.+)?", url or "")
+    return url if not m or not m.group(2) or m.group(2) == "/" else m.group(1) + "/…"
+
+
+def notify_contracts(state, now=None):
+    """Tells alerts_url about the last contract run if it differs from what was last sent.
+    A send that fails is tried again every ALERT_RETRY_SECONDS."""
+    now = now or time.time()
+    saved = saved_contracts()
+    if not ALERTS_URL or not saved or now < state.get("alert_retry_at", 0):
+        return
+    try:
+        with open(ALERTS_STATE) as fh:
+            alerted = json.load(fh).get("contracts")
+    except (OSError, ValueError):
+        alerted = None
+    alert = contract_alert(saved.get("results", []), alerted)
+    if alert is None:
+        return
+    key, title, text = alert
+    try:
+        send_alert(title, text)
+    except Exception as err:
+        state["alert_retry_at"] = now + ALERT_RETRY_SECONDS
+        log(f"could not send the contract alert ({err!r}); trying again in {ALERT_RETRY_SECONDS // 60} min")
+        return
+    tmp = ALERTS_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"contracts": key, "sent_at": now}, fh)
+    os.replace(tmp, ALERTS_STATE)
+    log(f"sent contract alert: {title}")
+
+
+def titles_due(registry, now, limit=2):
+    """Links whose phone title should be fetched again."""
+    due = [e["link"] for e in registry.values()
+           if e.get("state") == "open" and e.get("link") and now - e.get("title_at", 0) > TITLE_REFRESH_SECONDS]
+    return due[:limit]
+
+
+def apply_titles(registry, fetched, now):
+    """fetched: {link: title or None}, fetched outside the lock. None keeps the last known title."""
+    for entry in registry.values():
+        if entry.get("state") == "open" and entry.get("link") in fetched:
+            entry["title_at"] = now
+            if fetched[entry["link"]]:
+                entry["title"] = fetched[entry["link"]]
+
+
+def prefetch(state, now):
+    """Network calls for the next tick, made before taking the lock so CLI commands are not held
+    up by a slow API. Reads the registry without the lock: save() replaces it atomically."""
+    if PHONE_TITLES:
+        state["titles"] = {link: fetch_title(link) for link in titles_due(load(), now)}
+    if ARCHIVE_SYNC and now - state.get("archive_check", 0) >= ARCHIVE_CHECK_SECONDS:
+        state["archive_check"] = now
+        state["statuses"] = fetch_statuses()
+
+
+# --- tmux ----------------------------------------------------------------------------------
+
+
+def tmux(*args):
+    return subprocess.run(TMUX + list(args), capture_output=True, text=True)
+
+
+def tmux_ready():
+    if tmux("has-session", "-t", TMUX_SESSION).returncode == 0:
+        return True
+    subprocess.run(["systemctl", "--user", "start", TMUX_UNIT], capture_output=True)
+    return tmux("has-session", "-t", TMUX_SESSION).returncode == 0
+
+
+def tmux_panes():
+    """[(window_id, uuid or "", pane_dead, pane_pid, window_name)] for session rc."""
+    out = tmux("list-panes", "-s", "-t", TMUX_SESSION, "-F",  # contract: TMUX-1
+               "#{window_id}\t#{@afield_uuid}\t#{pane_dead}\t#{pane_pid}\t#{window_name}")
+    rows = []
+    for line in out.stdout.splitlines():
+        parts = (line.split("\t") + [""] * 5)[:5]
+        pid = int(parts[3]) if parts[3].isdigit() else 0
+        rows.append((parts[0], parts[1], parts[2] == "1", pid, parts[4]))
+    return rows
+
+
+def pane_map(panes):
+    return {pid: uuid for _w, uuid, dead, pid, _n in panes if pid and not dead}
+
+
+def windowed_uuids(panes):
+    """Sessions whose window is still running, even if Claude has not registered yet."""
+    return {uuid for _w, uuid, dead, _p, _n in panes if uuid and not dead}
+
+
+def close_window(window_id, why):
+    tail = tmux("capture-pane", "-p", "-t", window_id).stdout.strip().splitlines()[-4:]
+    log(f"closing window {window_id} ({why}); last lines: {' | '.join(tail)[:300]}")
+    tmux("kill-window", "-t", window_id)
+
+
+def trust_prompt_dir(screen):  # contract: SCREEN-1
+    """The folder a pane's trust prompt asks about, or None if it shows no trust prompt."""
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    if not any("Yes, I trust this folder" in l for l in lines):
+        return None
+    for i, line in enumerate(lines[:-1]):
+        if line.startswith("Accessing workspace:"):
+            return lines[i + 1]
+    return None
+
+
+def capture_screens(window_ids):
+    """{window id: screen} for several windows in one tmux call."""
+    window_ids = list(window_ids)
+    return split_captures(window_ids, tmux(*capture_args(window_ids)).stdout) if window_ids else {}
+
+
+def answer_trust(window_id, registry_entry, screen):
+    folder = trust_prompt_dir(screen)
+    if folder is None or folder not in AUTO_TRUST_DIRS or registry_entry.get("cwd") != folder:
+        return
+    tmux("send-keys", "-t", window_id, "Down")
+    time.sleep(0.5)
+    selected = [l for l in tmux("capture-pane", "-p", "-t", window_id).stdout.splitlines() if "\u276f" in l]
+    if any("Yes, I trust this folder" in l for l in selected):
+        tmux("send-keys", "-t", window_id, "Enter")
+        log(f"trusted {folder} for {window_name(registry_entry)} (you asked for this folder to be automatic)")
+
+
+def sync_windows(registry, panes):
+    for window_id in windows_to_close([(w, u, d) for w, u, d, _p, _n in panes]):
+        close_window(window_id, "session ended")
+    now = time.time()
+    screens = capture_screens(w for w, uuid, dead, _p, _n in panes
+                              if uuid in registry and not dead and trust_check_due(registry[uuid], now))
+    for window_id, screen in screens.items():
+        uuid = next(u for w, u, _d, _p, _n in panes if w == window_id)
+        answer_trust(window_id, registry[uuid], screen)
+    for window_id, uuid, dead, _pid, name in panes:
+        if uuid in registry and not dead and name != window_name(registry[uuid]):
+            tmux("rename-window", "-t", window_id, window_name(registry[uuid]))
+
+
+def launch(entry, wrapped, invs, new=False):
+    """Start the session in its own window. Returns True if the window started."""
+    if not new:
+        keep_link(entry)
+    for window_id, uuid, _d, _p, _n in tmux_panes():
+        if uuid == entry["uuid"]:
+            close_window(window_id, "replaced")
+    command = launch_command(entry["uuid"], wrapped, new=new, title=entry.get("title"))
+    out = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{TMUX_SESSION}:",
+               "-n", window_name(entry), "-c", entry["cwd"], "-e", f"EVEN_TERMINAL_PORT={EVEN_PORT}",  # contract: EVEN-2
+               "exec " + shlex.join(command))
+    window_id = out.stdout.strip()
+    if not window_id:
+        log(f"could not open a window for {entry['uuid'][:8]}: {out.stderr.strip()[:200]}")
+        return False
+    tmux("set-option", "-w", "-t", window_id, "@afield_uuid", entry["uuid"])
+    tmux("set-option", "-w", "-t", window_id, "remain-on-exit", "on")
+    tmux("set-option", "-w", "-t", window_id, "automatic-rename", "off")
+    entry.pop("handover", None)
+    entry["rewrap"] = not wrapped and not even_up()  # without the glasses only because Even is down
+    entry.update(state="open", host="tmux", invocation=invs.get("tmux"), absent=0,
+                 launched_at=time.time(), wrapped=wrapped, even=invs.get("even") if wrapped else None)
+    log(f"started {window_name(entry)} ({entry['uuid'][:8]}) in window {window_id}"
+        f"{'' if wrapped else ' without Even Terminal'}")
+    return True
+
+
+# --- registry ------------------------------------------------------------------------------
+
+
+class Locked:
+    """Serialises the supervisor and the CLI, so a session cannot be converted twice at once."""
+
+    def __init__(self, quiet=False):
+        self.quiet = quiet  # the supervisor; CLI commands say why they are waiting
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.fh = open(LOCK, "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not self.quiet:
+                print("afield: waiting for the supervisor to finish moving or starting a session…",
+                      file=sys.stderr, flush=True)
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.fh.close()
+
+
+def load():
+    try:
+        with open(REGISTRY) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(registry):
+    """Written only when it changed: the supervisor saves every tick, mostly with nothing new."""
+    text = json.dumps(registry, indent=1, sort_keys=True)
+    try:
+        with open(REGISTRY) as fh:
+            if fh.read() == text:
+                return
+    except OSError:
+        pass
+    tmp = f"{REGISTRY}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, REGISTRY)
+
+
+def record_live(registry, procs, invs):
+    now = time.time()
+    for proc in procs:
+        if proc["host"] == "external":
+            continue
+        if not in_scope(proc["cwd"], SERVED_DIR) and proc["uuid"] not in registry:
+            continue  # adopted glasses sessions may live elsewhere; nothing else outside is ours
+        if proc["host"] == "server" and not has_conversation(proc["cwd"], proc["uuid"]):
+            continue  # an untouched session has nothing worth keeping yet
+        if registry.get(proc["uuid"], {}).get("state") == "forgotten":
+            continue
+        entry = registry.setdefault(proc["uuid"], dict(uuid=proc["uuid"], state="open"))
+        entry.setdefault("name", proc["name"] or proc["uuid"][:8])
+        entry.update(cwd=proc["cwd"], host=proc["host"], invocation=invs.get(proc["host"]),
+                     link=proc["link"] or entry.get("link"), status=proc["status"], absent=0)
+        if now - entry.get("launched_at", 0) >= LAUNCH_GRACE_SECONDS:
+            entry["attempts"] = 0  # it stayed up, so earlier failures no longer count
+        entry["state"] = "open"
+        if proc["host"] == "tmux" and entry.get("wrapped", True):
+            entry.update(wrapped=True, even=invs.get("even"))
+
+
+def last_link_in_transcript(path):
+    last = None
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if '"bridge-session"' in line:
+                    try:
+                        last = json.loads(line).get("bridgeSessionId")
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return last
+
+
+def keep_link(entry):
+    """Point the transcript at the session's existing phone link, unless it already is."""
+    record = link_record(entry.get("link"), entry["uuid"])
+    if record is None:
+        return
+    if contracts_paused():  # contract: TRANS-2 (the line's format may have changed)
+        log(f"not writing a link line for {entry['uuid'][:8]}: contracts failed (afield doctor)")
+        return
+    path = transcript_path(entry["cwd"], entry["uuid"])
+    if last_link_in_transcript(path) == record["bridgeSessionId"]:
+        return
+    with open(path, "a") as fh:
+        fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def wait_gone(pid, seconds=15):
+    deadline = time.time() + seconds
+    while time.time() < deadline and os.path.exists(f"/proc/{pid}"):
+        time.sleep(0.25)
+    return not os.path.exists(f"/proc/{pid}")
+
+
+def stop_process(proc):
+    """Stop a headless server child or an old background job so its window can take over."""
+    if proc["host"] == "daemon":
+        short = proc["uuid"][:8]
+        subprocess.run(["claude", "stop", short], capture_output=True, timeout=60)
+        gone = wait_gone(proc["pid"])
+        if gone:  # the job record would otherwise refuse `claude --resume` (tested)
+            subprocess.run(["claude", "rm", short], capture_output=True, timeout=60)
+        return gone
+    try:
+        os.kill(proc["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    return wait_gone(proc["pid"])
+
+
+def convert(entry, proc, invs, wrapped):
+    log(f"moving {window_name(entry)} ({entry['uuid'][:8]}) from {proc['host']} into a window")
+    if not stop_process(proc):
+        log(f"{entry['uuid'][:8]} did not stop; leaving it as it is")
+        return False
+    entry.update(link=proc["link"] or entry.get("link"), attempts=0)
+    if proc["host"] == "server" and invs.get("server"):
+        entry["server_bound"] = invs["server"]  # see tied_to_server
+    return launch(entry, wrapped, invs)
+
+
+def server_children():
+    """Pids of the Remote Control server's child processes (one per chat it is answering)."""
+    pid = unit_property(SERVER_UNIT, "MainPID")
+    if not pid or pid == "0":
+        return []
+    children = []
+    for path in glob.glob(f"/proc/{pid}/task/*/children"):
+        try:
+            with open(path) as fh:
+                children += fh.read().split()
+        except OSError:
+            pass
+    return children
+
+
+def untie_from_server(state, registry, invs, procs):
+    """Restart the empty server so the chats moved out of it are reached in their windows only."""
+    tied = [e for e in registry.values() if e.get("server_bound") and e.get("server_bound") == invs.get("server")
+            and e.get("state") == "open" and e.get("host") == "tmux"]
+    if not tied or time.time() - state.get("untied_at", 0) < UNTIE_RETRY_SECONDS:
+        return False
+    windows = {p["uuid"]: p for p in procs if p["host"] == "tmux"}
+    tied = tied_to_server(tied, invs["server"], server_children(), seconds_since_start(SERVER_UNIT),
+                          SERVER_GRACE_SECONDS, windows, time.time())
+    if not tied:
+        return False
+    state["untied_at"] = time.time()
+    names = ", ".join(window_name(e) for e in tied)
+    log(f"restarting the empty Remote Control server, so the phone reaches {names} in its window "
+        "instead of starting a second copy on the server")
+    subprocess.run(["systemctl", "--user", "restart", SERVER_UNIT], capture_output=True, timeout=60)
+    return True
+
+
+def stop_ghost_replies(state, procs, panes):
+    """A window still working after a server copy took its phone connection: stop that reply
+    (Esc, as you would), so only one copy of the session works. The server copy is the one you see."""
+    done = state.setdefault("ghosts_stopped", {})
+    for proc in ghost_windows(procs):
+        key = str(proc["pid"])
+        if time.time() - done.get(key, 0) < GHOST_RETRY_SECONDS:
+            continue
+        window_id = next((w for w, u, dead, _p, _n in panes if u == proc["uuid"] and not dead), None)
+        if not window_id:
+            continue
+        done[key] = time.time()
+        log(f"the phone moved to a server copy of {proc['uuid'][:8]} while its window was still working; "
+            "stopping the window's reply so only one copy works on it")
+        tmux("send-keys", "-t", window_id, "Escape")  # contract: SCREEN-1 (esc to interrupt)
+    for key in [k for k, t in done.items() if time.time() - t > 3600]:
+        del done[key]
+
+
+def dismiss_env_setup(state, registry, panes):
+    """Close Claude Code's auto mode setup pop-up in any window, so glasses messages reach the chat.
+    The offer gets "Don't show again", which Claude Code saves for every session; the wizard (started
+    when a glasses Enter picked Yes) gets Esc. Returns how many windows were answered."""
+    done = state.setdefault("env_setup_answered", {})
+    now = time.time()
+    uuids = {w: uuid for w, uuid, dead, _p, _n in panes
+             if uuid in registry and not dead and now - done.get(w, 0) >= ENV_SETUP_RETRY_SECONDS}
+    answered = 0
+    for window_id, screen in capture_screens(uuids).items():
+        kind = env_setup_prompt(screen)
+        if kind is None:
+            continue
+        done[window_id] = now
+        answered += 1
+        name = window_name(registry[uuids[window_id]])
+        if kind == "wizard":
+            tmux("send-keys", "-t", window_id, "Escape")  # contract: SCREEN-2 (Esc to cancel)
+            log(f"closed Claude Code's auto mode setup in {name}; a glasses Enter had started it")
+            continue
+        on_dismiss = False
+        for _ in range(len(ENV_SETUP_OPTIONS)):  # Down until ❯ is on "3. Don't show again"
+            selected = [l for l in tmux("capture-pane", "-p", "-t", window_id).stdout.splitlines()
+                        if "❯" in l and ". " in l]
+            on_dismiss = any("Don't show again" in l for l in selected)
+            if on_dismiss:
+                break
+            tmux("send-keys", "-t", window_id, "Down")
+            time.sleep(0.3)
+        if on_dismiss:
+            tmux("send-keys", "-t", window_id, "Enter")
+            log(f"answered \"Don't show again\" to Claude Code's auto mode setup pop-up in {name}, "
+                "so glasses messages reach the chat")
+        else:  # the options moved; Esc still closes it (Claude Code asks again in a week)
+            tmux("send-keys", "-t", window_id, "Escape")
+            log(f"closed Claude Code's auto mode setup pop-up in {name} with Esc; "
+                "\"Don't show again\" was not where afield expected (see CONTRACTS.md#screen-2)")
+    for key in [k for k, t in done.items() if now - t > 3600]:
+        del done[key]
+    return answered
+
+
+def stale_job(uuid):
+    """A job record left by the earlier --bg version blocks `claude --resume`; remove it."""
+    if os.path.isdir(f"{JOBS_DIR}/{uuid[:8]}"):
+        subprocess.run(["claude", "rm", uuid[:8]], capture_output=True, timeout=60)
+
+
+# --- supervisor --------------------------------------------------------------------------------
+
+
+def wrap_choice(up, expected, waited, limit=EVEN_WAIT_SECONDS):
+    """True: start sessions wrapped for the glasses. False: start them without. None: wait.
+    An installed Even Terminal gets `limit` seconds at boot; without one nobody waits."""
+    if up:
+        return True
+    if not expected:
+        return False
+    return None if waited < limit else False
+
+
+def wrap_now(state, expected):
+    if even_up():
+        state.pop("even_wait_since", None)  # so a later outage gets its own wait
+        return True
+    waited = time.time() - state.setdefault("even_wait_since", time.time())
+    return wrap_choice(False, expected, waited)
+
+
+def tick(state):
+    if not tmux_ready():
+        log("tmux server is not running; waiting")
+        return
+    invs = invocations()
+    record_all_restarts(state, invs, time.time())
+    panes = tmux_panes()
+    procs = live_processes(pane_map(panes))
+    registry = load()
+    record_live(registry, procs, invs)
+    apply_titles(registry, state.pop("titles", {}), time.time())
+    statuses = state.pop("statuses", None)  # fetched by prefetch() every ARCHIVE_CHECK_SECONDS
+    paused = contracts_paused()
+    if statuses is not None and not paused:
+        running = {p["uuid"] for p in procs}
+        for uuid in archived_to_retire(registry.values(), statuses, running, time.time(),
+                                       LAUNCH_GRACE_SECONDS * 2):
+            entry = registry[uuid]
+            log(f"{window_name(entry)} ({uuid[:8]}) was archived in the app; retiring it")
+            registry[uuid] = dict(uuid=uuid, state="forgotten", cwd=entry.get("cwd"))
+            for window_id, u, _d, _p, _n in panes:
+                if u == uuid:
+                    close_window(window_id, "archived in the app")
+    live = {p["uuid"] for p in procs} | windowed_uuids(panes)
+    kills = oom_kills()
+    oom = kills > state.get("kills", kills)
+    state["kills"] = kills
+    wrapped = wrap_now(state, invs["even_expected"])
+    invs["even_waiting"] = wrapped is None
+
+    now_ms = time.time() * 1000
+    if not paused:
+        stop_ghost_replies(state, procs, panes)
+        dismiss_env_setup(state, registry, panes)
+    if wrapped is not None and not paused:
+        for proc in procs:
+            entry = registry.get(proc["uuid"])
+            if entry is None:
+                continue
+            proc["has_chat"] = True  # record_live only tracks server children that have a chat
+            if should_convert(proc, now_ms, IDLE_MS, handover=entry.get("handover", False)):
+                if proc["pid"] in duplicates_to_stop(procs, now_ms, IDLE_MS):
+                    log(f"the phone reached a server copy of {window_name(entry)}; relaunching its window")
+                convert(entry, proc, invs, wrapped)
+                save(registry)
+                return  # one change per tick; the next tick sees the new state
+
+    if untie_from_server(state, registry, invs, procs):
+        return
+
+    if wrapped is not None and not paused:
+        since = adopt_since()
+        for t in recent_transcripts():
+            if t["cwd"] and should_adopt(t, time.time(), since, set(registry), live, IDLE_MS / 1000):
+                entry = registry[t["uuid"]] = dict(uuid=t["uuid"], state="open", cwd=t["cwd"],
+                                                   name="glasses-" + t["uuid"][:4], absent=0, attempts=0)
+                log(f"adopting glasses session {t['uuid'][:8]} in {t['cwd']}")
+                launch(entry, wrapped, invs)
+                save(registry)
+                return
+
+    if wrapped is not None:  # relaunching a window keeps a session alive, so it goes on while paused
+        idle_windows = {}  # window id -> (uuid, proc), for idle windows that may need a relaunch
+        for window_id, uuid, dead, _pid, _name in panes:
+            proc = next((p for p in procs if p["uuid"] == uuid and p["host"] == "tmux"), None)
+            if dead or uuid not in registry or not proc or proc["status"] != "idle":
+                continue
+            if now_ms - (proc["status_at"] or 0) < IDLE_MS:
+                continue
+            if any(p["uuid"] == uuid and p["host"] == "server" for p in procs):
+                continue  # the server copy is answering; it is moved back once idle
+            if should_rewrap(registry[uuid], proc, wrapped is True, now_ms, IDLE_MS):
+                log(f"Even Terminal is back; putting {window_name(registry[uuid])} back on the glasses")
+                stop_process(proc)
+                launch(registry[uuid], True, invs)
+                save(registry)
+                return
+            idle_windows[window_id] = (uuid, proc)
+        for window_id, (uuid, proc) in idle_windows.items():
+            if phone_lost(registry[uuid], proc, time.time()):
+                log(f"{window_name(registry[uuid])} has no phone connection; relaunching its window")
+                registry[uuid]["phone_relaunch_at"] = time.time()
+                stop_process(proc)
+                launch(registry[uuid], wrapped, invs)
+                save(registry)
+                return
+        for window_id, screen in capture_screens(idle_windows).items():  # one tmux call for all
+            uuid, proc = idle_windows[window_id]
+            if stood_down(screen):
+                log(f"{window_name(registry[uuid])} lost its phone connection; relaunching its window")
+                stop_process(proc)
+                launch(registry[uuid], wrapped, invs)
+                save(registry)
+                return
+
+    candidates = []
+    now = time.time()
+    for entry in registry.values():
+        action = decide(entry, live, invs, oom, now)
+        if action == "count":
+            entry["absent"] = entry.get("absent", 0) + 1
+        elif action == "closed":
+            log(f"{window_name(entry)} ({entry['uuid'][:8]}) was closed; not reopening it")
+            entry["state"] = "closed"
+        elif action == "reopen":
+            if not has_conversation(entry["cwd"], entry["uuid"]):
+                entry["state"] = "closed"
+                continue
+            entry["mtime"] = transcript_mtime(entry["cwd"], entry["uuid"])
+            candidates.append(entry)
+
+    server_settled = not invs["server"] or seconds_since_start(SERVER_UNIT) >= SERVER_GRACE_SECONDS
+    if wrapped is not None and server_settled and candidates and slice_memory() < DEFER_ABOVE_BYTES:
+        hosted = sum(1 for p in procs if p["host"] != "external")
+        for entry in select_reopen(candidates, hosted, MAX_OPEN, now, MAX_AGE_SECONDS):
+            if now - entry.get("last_attempt", 0) < RETRY_SECONDS:
+                continue
+            if entry.get("attempts", 0) >= MAX_ATTEMPTS:
+                log(f"giving up on {entry['uuid'][:8]}; run: afield reopen {entry['uuid'][:8]}")
+                entry["state"] = "failed"
+                continue
+            entry["last_attempt"] = now
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            stale_job(entry["uuid"])
+            # The last attempt goes without the wrapper, in case the wrapper is what fails.
+            launch(entry, wrapped and entry["attempts"] < MAX_ATTEMPTS, invs)
+            break  # one per tick, so a boot does not start them all at once
+    save(registry)
+    sync_windows(registry, tmux_panes())
+
+
+def supervise():
+    log("afield supervisor started")
+    try:  # the registry names your chats and their phone links: yours only (the files inside follow)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+    except OSError as err:
+        log(f"could not make {STATE_DIR} private: {err}")
+    state = {}
+    while True:
+        try:
+            supervise_contracts(state)
+        except Exception as err:
+            log(f"contract check failed to run: {err!r}")
+        try:
+            notify_contracts(state)
+        except Exception as err:
+            log(f"contract alert failed: {err!r}")
+        try:
+            prefetch(state, time.time())
+            with Locked(quiet=True):
+                tick(state)
+        except Exception as err:  # the supervisor must outlive one bad tick
+            log(f"tick failed: {err!r}")
+        time.sleep(TICK_SECONDS)
+
+
+# --- CLI -----------------------------------------------------------------------------------
+
+
+def find(registry, key):
+    def names(e):
+        return [e.get("name") or "", e.get("title") or ""]
+    tracked = [e for e in registry.values() if e["state"] != "forgotten"]
+    matches = [e for e in tracked if e["uuid"].startswith(key) or key in names(e)]
+    if not matches:
+        matches = [e for e in tracked if any(key.lower() in n.lower() for n in names(e))]
+    if len(matches) != 1:
+        listed = ", ".join(f"{window_name(e)} ({e['uuid'][:8]})" for e in matches) or "none"
+        hint = ("\nIf it was forgotten or retired: afield list --all, then afield open --revive <id>."
+                if not matches else "")
+        sys.exit(f"afield: '{key}' matched {len(matches)} sessions: {listed}{hint}")
+    return matches[0]
+
+
+def describe(proc, entry, running=0, limit=MAX_OPEN):
+    """running: sessions afield hosts right now, for explaining why an open one is not up."""
+    if proc is None:
+        if entry["state"] == "open":
+            return f"queued ({running} running, the most at once)" if running >= limit else "starting"
+        if entry["state"] == "failed":
+            return "failed (afield reopen)"
+        return entry["state"]
+    if proc["host"] == "tmux":
+        where = "terminal+phone+glasses" if entry.get("wrapped", True) else "terminal+phone"
+    else:
+        where = {"server": "phone (moving to terminal)", "daemon": "old bg job (moving)",
+                 "external": "open elsewhere"}[proc["host"]]
+    if proc["host"] == "tmux" and entry.get("link") and not proc.get("link"):
+        where = "terminal+glasses, PHONE DISCONNECTED" if entry.get("wrapped", True) else "terminal, PHONE DISCONNECTED"
+    return f"{where}, {proc['status']}"
+
+
+def untracked(registry, transcripts, now, max_age=MAX_AGE_SECONDS):
+    """Recent chats afield does not keep: forgotten ones and ones it never tracked.
+    transcripts: [dict(uuid, mtime, first_prompt)]. Newest first."""
+    rows = [t for t in transcripts if now - t["mtime"] <= max_age
+            and registry.get(t["uuid"], {}).get("state") in (None, "forgotten")]
+    return sorted(rows, key=lambda t: t["mtime"], reverse=True)
+
+
+def first_prompt(path):
+    """The first thing you typed in a transcript, for telling untracked chats apart."""
+    try:
+        with open(path, errors="replace") as fh:
+            for _ in range(400):
+                line = fh.readline()
+                if not line:
+                    break
+                if '"type":"user"' not in line:
+                    continue
+                content = json.loads(line).get("message", {}).get("content")
+                if isinstance(content, list):
+                    content = next((c.get("text") for c in content if c.get("type") == "text"), None)
+                if isinstance(content, str) and content.strip() and not content.lstrip().startswith("<"):
+                    return " ".join(content.split())
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def transcript_summaries(since):
+    found = []
+    for path in glob.glob(f"{PROJECTS_DIR}/*/*.jsonl"):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime >= since:
+            found.append(dict(uuid=os.path.basename(path)[:-len(".jsonl")], mtime=mtime, path=path))
+    return found
+
+
+def rss_bytes(pid):
+    """Resident memory of one process, or None once it has gone."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def memory_words(nbytes):
+    return "" if nbytes is None else f"{nbytes / 1024**2:.0f} MB" if nbytes < 1024**3 else f"{nbytes / 1024**3:.1f} GB"
+
+
+def cmd_list(show_all=False):
+    with Locked():
+        registry = load()
+        # A window and a server copy can briefly share a session; show the window.
+        procs = {p["uuid"]: p for p in sorted(live_processes(pane_map(tmux_panes())), key=lambda p: p["host"] == "tmux")}
+    running = len({p["uuid"] for p in procs.values() if p["host"] != "external"})
+    rows = sorted((e for e in registry.values() if e["state"] != "forgotten"), key=lambda e: transcript_mtime(e["cwd"], e["uuid"]), reverse=True)
+    if not rows:
+        print("No sessions tracked yet.")
+    for entry in rows:
+        proc = procs.get(entry["uuid"])
+        mem = memory_words(rss_bytes(proc["pid"])) if proc else ""
+        print(f"{entry['uuid'][:8]}  {window_name(entry):30}  {describe(proc, entry, running):34}  {mem:>7}  "
+              f"https://claude.ai/code/{entry.get('link') or '?'}")
+    if not show_all:
+        return
+    now = time.time()
+    rest = untracked(registry, transcript_summaries(now - MAX_AGE_SECONDS), now)
+    if not rest:
+        print("\nNo untracked chats in the last 14 days.")
+        return
+    print(f"\nNot kept by afield (last 14 days; bring one back with: afield open --revive <id>):")
+    for t in rest[:25]:
+        state = "forgotten" if t["uuid"] in registry else ("running" if t["uuid"] in procs else "untracked")
+        when = datetime.fromtimestamp(t["mtime"]).strftime("%b %d %H:%M")
+        print(f"{t['uuid'][:8]}  {when}  {state:9}  {(first_prompt(t['path']) or '(no typed prompt)')[:70]}")
+    if len(rest) > 25:
+        print(f"… and {len(rest) - 25} more")
+
+
+def status_report(now=None):
+    """Everything `afield status` shows, as data (also printed as JSON with --json)."""
+    now = time.time() if now is None else now
+    with Locked():
+        registry = load()
+        procs = live_processes(pane_map(tmux_panes()))
+    units = [SERVER_UNIT, TMUX_UNIT, "afield-supervisor.service", "afield.target", EVEN_UNIT]
+    shown = units_show(units, ["ActiveState", "UnitFileState"])
+    state = {u: shown.get(u, {}).get("ActiveState") or "unknown" for u in units}
+    hosted = {p["uuid"] for p in procs if p["host"] != "external"}
+    health = read_server_health()
+    server_ok, server_words = server_health(state[SERVER_UNIT], health.get("restarts", []), now)
+    saved = saved_contracts()
+    glasses = None
+    if even_expected(shown.get(EVEN_UNIT, {})):
+        even_ok, even_words = even_health(health.get("even_restarts", []), now)
+        glasses = {"unit": state[EVEN_UNIT], "port": EVEN_PORT, "up": even_up(), "ok": even_ok, "warning": even_words,
+                   "only_afield": GLASSES_ONLY_AFIELD,
+                   "proxy": units_show([PROXY_UNIT], ["ActiveState"]).get(PROXY_UNIT, {}).get("ActiveState") or "unknown"}
+    return {
+        "units": state,
+        "server": {"ok": server_ok, "summary": server_words},
+        "glasses": glasses,
+        "memory": {"used_bytes": slice_memory(), "max_bytes": MEMORY_MAX_BYTES, "defer_above_bytes": DEFER_ABOVE_BYTES},
+        "sessions": {"running": len(hosted), "kept_open": sum(1 for e in registry.values() if e["state"] == "open"),
+                     "max_open": MAX_OPEN},
+        "contracts": {"line": contracts_line(saved, now), "blocking": (saved or {}).get("blocking", []),
+                      "ran_at": (saved or {}).get("ran_at")},
+        "config": {"path": CONFIG_PATH, "problems": CONFIG_PROBLEMS,
+                   "archive_sync": ARCHIVE_SYNC, "phone_titles": PHONE_TITLES},
+    }
+
+
+def cmd_status(as_json=False):
+    r = status_report()
+    if as_json:
+        print(json.dumps(r, indent=1))
+        return
+    u = r["units"]
+    print(f"all         {'afield.target':30} {u['afield.target']}")
+    print(f"server      {SERVER_UNIT:30} {r['server']['summary']}")
+    print(f"tmux        {TMUX_UNIT:30} {u[TMUX_UNIT]}")
+    print(f"supervisor  {'afield-supervisor.service':30} {u['afield-supervisor.service']}")
+    g = r["glasses"]
+    if g:
+        print(f"glasses     {EVEN_UNIT:30} {g['unit']}, "
+              f"port {g['port']} {'up' if g['up'] else 'DOWN (sessions start without the glasses)'}")
+        if not g["ok"]:
+            print(f"            {g['warning']}")
+        if g["only_afield"] and g["proxy"] != "active":
+            print(f"            {PROXY_UNIT} is {g['proxy']}: the glasses cannot reach Even (rerun install.sh)")
+        elif g["only_afield"]:
+            print(f"            the glasses list afield's sessions only ({PROXY_UNIT})")
+    else:
+        print(f"glasses     {EVEN_UNIT:30} not installed (install.sh --with-even for the Even G2 glasses)")
+    m = r["memory"]
+    print(f"memory      {m['used_bytes'] / 1024**3:.1f} GB of {m['max_bytes'] / 1024**3:.0f} GB "
+          f"(no new reopens above {m['defer_above_bytes'] / 1024**3:.0f} GB)")
+    n = r["sessions"]
+    print(f"sessions    {n['running']} running, {n['kept_open']} kept open, at most {n['max_open']} at once")
+    api = [name for name, on in (("archive sync", ARCHIVE_SYNC), ("phone titles", PHONE_TITLES)) if on]
+    print(f"phone API   {', '.join(api) + ' on' if api else 'off'} (config: archive_sync, phone_titles)")
+    print(f"contracts   {r['contracts']['line']}")
+    for problem in r["config"]["problems"]:
+        print(f"config      {problem} ({CONFIG_PATH})")
+    print("details     afield list · afield logs · afield doctor")
+
+
+def cmd_config(key=None):
+    """Print the effective config (defaults plus the file), or one value for scripts."""
+    if key is not None:
+        if key not in CONFIG:
+            sys.exit(f"afield: no config key {key!r} (known: {', '.join(CONFIG)})")
+        value = CONFIG[key]
+        if key == "served_dir":
+            value = SERVED_DIR
+        print(value if not isinstance(value, (list, bool)) else json.dumps(value))
+        return
+    print(f"# {CONFIG_PATH} ({'found' if os.path.exists(CONFIG_PATH) else 'not found: all defaults'})")
+    for problem in CONFIG_PROBLEMS:
+        print(f"# problem: {problem}")
+    print(json.dumps(dict(CONFIG, alerts_url=masked_url(CONFIG["alerts_url"])), indent=1))
+    print("# change one: afield config set <key> <value>   (afield config help)")
+
+
+def cmd_config_set(key, words=None, unset=False):
+    """Save one setting (or remove it, for the default) in the config file, then apply it."""
+    if unset and key not in CONFIG_DEFAULTS:
+        sys.exit(f"afield: no config key {key!r} (known: {', '.join(CONFIG_DEFAULTS)})")
+    try:
+        value = None if unset else parse_config_value(key, words)
+    except ValueError as err:
+        sys.exit(f"afield: {err}")
+    target = os.path.realpath(CONFIG_PATH)  # write through a link rather than replace it
+    try:
+        with open(target) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as err:
+        sys.exit(f"afield: cannot read {CONFIG_PATH} ({err}); fix it by hand first")
+    if not isinstance(data, dict):
+        sys.exit(f"afield: {CONFIG_PATH} is not a JSON object; fix it by hand first")
+    before = CONFIG[key]
+    if unset:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    after = CONFIG_DEFAULTS[key] if unset else value
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.tmp-{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, target)
+    shown = masked_url if key == "alerts_url" else (lambda v: v)
+    print(f"{key}: {json.dumps(shown(before))} -> {json.dumps(shown(after))}"
+          + (" (the default)" if unset else "") + f"  [{CONFIG_PATH}]")
+    if before == after:
+        print("No change in effect, so nothing to restart.")
+        return
+    how = CONFIG_HELP[key][1]
+    if how == "supervisor":
+        if unit_property("afield-supervisor.service", "ActiveState") == "active":
+            subprocess.run(["systemctl", "--user", "restart", "afield-supervisor.service"], check=False)
+            print("Supervisor restarted; the new value is in effect. Running sessions were not touched.")
+        else:
+            print("The supervisor is not running; it uses the new value when it starts.")
+        return
+    repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    print(f"To apply it, run {repo}/install.sh (sessions keep running).")
+    if how == "restart":
+        print("It fully applies only once the services restart, which restarts every session "
+              "(systemctl --user restart afield.target, or a reboot). Pick a quiet moment.")
+
+
+def contracts_line(saved, now):
+    """One line for `afield status` about the last contract check."""
+    if not saved:
+        return "not checked yet (afield doctor)"
+    v = saved.get("versions", {})
+    seen = " · ".join(f"{k} {x}" for k, x in v.items() if x and k != "tmux")
+    ago = int((now - saved.get("ran_at", now)) / 60)
+    counts = {}
+    for r in saved.get("results", []):
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    if saved.get("blocking"):
+        return (f"FAILED {', '.join(saved['blocking'])}: moving, adopting, archive sync and link writes "
+                f"paused · afield doctor")
+    extra = "".join(f", {counts[k]} {k}" for k in ("changed", "skip") if counts.get(k))
+    return f"ok ({counts.get('ok', 0)} pass{extra}) · {seen} · checked {ago} min ago"
+
+
+def cmd_doctor(args):
+    """Runs the contract tests and prints what differs. Exit status 1 if any failed."""
+    e2e = "--e2e" in args
+    update = "--update-snapshot" in args
+    candidate = args[args.index("--candidate") + 1] if "--candidate" in args[:-1] else None
+    c = contracts()
+    if candidate:
+        print(f"checking the candidate {candidate} (static checks only: it is not the one running)")
+    levels = ("static",) if candidate else ("static", "live", "e2e") if e2e else ("static", "live")
+    if e2e:
+        print("e2e: starts a throwaway session, sends it one message, resumes it, archives it, removes it")
+    results, seen = check_contracts(levels, claude=candidate, log=print)
+    print(c.format_report(results, seen, candidate=bool(candidate)))
+    if update:
+        if any(r["status"] == c.FAIL for r in results):
+            sys.exit("not updating the snapshot while a contract fails: fix the code (or the check) first")
+        with open(c.SNAPSHOT, "w") as fh:
+            json.dump(c.snapshot_from(results, seen), fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        print(f"snapshot updated: {c.SNAPSHOT} (commit it)")
+    sys.exit(1 if any(r["status"] == c.FAIL for r in results) else 0)
+
+
+def cmd_logs():
+    os.execvp("journalctl", ["journalctl", "--user", "-u", "afield-supervisor", "-n", "40", "-f", "-o", "short"])
+
+
+def make_terminal_ready(entry):
+    """Move or reopen one session now instead of waiting for the supervisor."""
+    invs = invocations()
+    record_all_restarts(state, invs, time.time())
+    panes = tmux_panes()
+    if entry["uuid"] in windowed_uuids(panes):
+        return True
+    procs = [p for p in live_processes(pane_map(panes)) if p["uuid"] == entry["uuid"]]
+    if any(p["host"] == "external" for p in procs):
+        sys.exit(f"afield: {window_name(entry)} is open in another terminal; close it first.")
+    proc = next((p for p in procs if p["host"] in ("server", "daemon")), None)
+    if proc and proc["status"] not in ("idle", None):
+        sys.exit(f"afield: {window_name(entry)} is {proc['status']}; it moves to the terminal "
+                 "automatically once it is idle.")
+    if proc:
+        return convert(entry, proc, invs, even_up())
+    stale_job(entry["uuid"])
+    entry.update(attempts=0)
+    return launch(entry, even_up(), invs)
+
+
+def cmd_open(key=None, revive_forgotten=False):
+    if not tmux_ready():
+        sys.exit("afield: the tmux server is not running (systemctl --user status afield-tmux).")
+    with Locked():
+        registry = load()
+        if key is not None:
+            entry = revive(registry, key) if revive_forgotten else find(registry, key)
+            ok = make_terminal_ready(entry)
+            save(registry)
+            if not ok:
+                sys.exit("afield: could not open the session; see the supervisor log.")
+            target = next((w for w, u, d, _p, _n in tmux_panes() if u == entry["uuid"] and not d), None)
+            if target:
+                tmux("select-window", "-t", target)
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}  # allow opening from inside tmux
+    os.execvpe("tmux", TMUX + ["attach-session", "-t", TMUX_SESSION], env)
+
+
+def revive(registry, key):
+    """Put a forgotten or never-tracked session back in the registry as closed, ready to reopen.
+    A session that is still tracked is returned as it is."""
+    tracked = [e for e in registry.values() if e["state"] != "forgotten"
+               and (e["uuid"].startswith(key) or key in (e.get("name"), e.get("title")))]
+    if len(tracked) == 1:
+        return tracked[0]
+    uuid, cwd, link = locate_transcript(key)
+    if registry.get(uuid, {}).get("state") not in (None, "forgotten"):
+        return registry[uuid]
+    old = registry.get(uuid)
+    link = (old or {}).get("link") or link
+    entry = registry[uuid] = revive_entry(old, uuid, cwd, link, fetch_title(link) if link and PHONE_TITLES else None)
+    log(f"revived {window_name(entry)} ({uuid[:8]}) from its transcript in {cwd}")
+    return entry
+
+
+def reopen_entry(registry, entry):
+    """Reopen one entry (call with the lock held). Returns what to tell the user."""
+    live = windowed_uuids(tmux_panes()) | {p["uuid"] for p in live_processes(pane_map(tmux_panes()))}
+    if entry["uuid"] in live:
+        save(registry)
+        return f"{window_name(entry)} is already running."
+    stale_job(entry["uuid"])
+    entry.update(attempts=0)
+    ok = tmux_ready() and launch(entry, even_up(), invocations())
+    save(registry)
+    return "Reopened." if ok else "Reopen failed."
+
+
+def cmd_reopen(key, revive_forgotten=False):
+    with Locked():
+        registry = load()
+        entry = revive(registry, key) if revive_forgotten else find(registry, key)
+        message = reopen_entry(registry, entry)
+    print(message)
+
+
+def cmd_new(title=None):
+    if title and title.startswith("-"):  # it is passed to claude as an argument, after the flags
+        sys.exit("afield: a title cannot start with '-'.")
+    if not tmux_ready():
+        sys.exit("afield: the tmux server is not running (systemctl --user status afield-tmux).")
+    with Locked():
+        registry = load()
+        uuid = str(uuid_mod.uuid4())
+        entry = registry[uuid] = dict(uuid=uuid, state="open", cwd=SERVED_DIR, absent=0, attempts=0,
+                                      name=title or "new-" + uuid[:4], **({"title": title} if title else {}))
+        ok = launch(entry, even_up(), invocations(), new=True)
+        if not ok:
+            del registry[uuid]
+        save(registry)
+    if not ok:
+        sys.exit("afield: could not start the session; see the supervisor log.")
+    target = next((w for w, u, d, _p, _n in tmux_panes() if u == uuid and not d), None)
+    if target:
+        tmux("select-window", "-t", target)
+    if sys.stdout.isatty():
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        os.execvpe("tmux", TMUX + ["attach-session", "-t", TMUX_SESSION], env)
+    print(f"Started {window_name(entry)} ({uuid[:8]}).")
+
+
+def cmd_adopt(key, revive_forgotten=False):
+    with Locked():
+        registry = load()
+        panes = tmux_panes()
+        procs = [p for p in live_processes(pane_map(panes)) if p["uuid"].startswith(key) or p["name"] == key]
+        if not procs and not revive_forgotten:
+            sys.exit(f"afield: no running session matches {key}. "
+                     f"If it has stopped, `afield adopt --revive {key}` brings it back.")
+        if not procs:  # stopped: bring it back from its transcript instead
+            message = reopen_entry(registry, revive(registry, key))
+            print(message)
+            return
+        if len({p["uuid"] for p in procs}) > 1:
+            sys.exit(f"afield: {key} matches more than one session; use more of its id.")
+        proc = procs[0]
+        if proc["host"] != "external":
+            print("That session is already kept by afield.")
+            return
+        entry = registry.get(proc["uuid"])
+        if entry is None or entry.get("state") == "forgotten":
+            entry = registry[proc["uuid"]] = dict(uuid=proc["uuid"], name=proc["name"] or proc["uuid"][:8])
+        entry.update(state="open", cwd=proc["cwd"], host="external", link=proc["link"] or entry.get("link"),
+                     absent=0, attempts=0, handover=True)
+        save(registry)
+    print(f"{window_name(entry)} moves into afield once it has been idle for "
+          f"{IDLE_MS // 1000}s. The terminal it runs in now will close, and anything typed "
+          "there but not sent is lost, so send or clear it first.")
+
+
+def cmd_retire(key=None):
+    with Locked():
+        registry = load()
+        if key is None:
+            panes = tmux_panes()
+            uuid = session_of(ancestors(os.getpid(), depth=12), live_processes(pane_map(panes)))
+            if uuid is None or registry.get(uuid, {}).get("state") in (None, "forgotten"):
+                sys.exit("afield: this is not a tracked session; give a name or id.")
+            entry = registry[uuid]
+        else:
+            entry = find(registry, key)
+        archived = RETIRE_ARCHIVES and bool(entry.get("link")) and archive_link(entry["link"])
+        name, uuid = window_name(entry), entry["uuid"]
+        registry[uuid] = dict(uuid=uuid, state="forgotten", cwd=entry.get("cwd"))
+        save(registry)
+        windows = [w for w, u, _d, _p, _n in tmux_panes() if u == uuid]
+    if not RETIRE_ARCHIVES:
+        phone = "archive it in the app yourself (or: afield config set retire_archives true)"
+    else:
+        phone = "archived on the phone" if archived else "could NOT archive on the phone (do it in the app)"
+    print(f"Retired {name}: {phone}"
+          + ", no longer tracked. Its transcript is still on disk.")
+    for w in windows:  # a moment later, so a session retiring itself can still finish this reply
+        subprocess.Popen(["tmux", "-L", TMUX[2], "run-shell", "-b", f"sleep 5; tmux -L {TMUX[2]} kill-window -t {w}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_forget(key):
+    with Locked():
+        registry = load()
+        entry = find(registry, key)
+        # Keep a marker: deleting the entry would let the supervisor adopt the session again.
+        registry[entry["uuid"]] = dict(uuid=entry["uuid"], state="forgotten", cwd=entry.get("cwd"))
+        save(registry)
+    print(f"No longer tracking {window_name(entry)}. Its transcript is still on disk.")
+
+
+def main(argv):
+    if len(argv) == 1 or (len(argv) == 2 and argv[1] in ("open", "attach")):
+        cmd_open()
+    elif len(argv) == 2 and argv[1] in ("supervise", "keep"):
+        supervise()
+    elif len(argv) == 2 and argv[1] in ("help", "--help", "-h"):
+        print(__doc__)
+        print(config_help(CONFIG, CONFIG_PATH))
+    elif argv[1:3] in (["config", "help"], ["config", "--help"], ["config", "-h"]) and len(argv) == 3:
+        print(config_help(CONFIG, CONFIG_PATH))
+    elif argv[1:3] == ["config", "set"] and len(argv) >= 5:
+        cmd_config_set(argv[3], argv[4:])
+    elif argv[1:3] == ["config", "unset"] and len(argv) == 4:
+        cmd_config_set(argv[3], unset=True)
+    elif argv[1:3] in (["config", "set"], ["config", "unset"]):
+        sys.exit("usage: afield config set <key> <value...> | afield config unset <key>   (afield config help)")
+    elif argv[1:2] == ["list"] and argv[2:] in ([], ["--all"], ["-a"]):
+        cmd_list(show_all=bool(argv[2:]))
+    elif argv[1:2] == ["status"] and argv[2:] in ([], ["--json"]):
+        cmd_status(as_json=bool(argv[2:]))
+    elif argv[1:2] == ["config"] and len(argv) <= 3:
+        cmd_config(argv[2] if len(argv) == 3 else None)
+    elif argv[1:2] == ["doctor"] and set(argv[2:]) - {"--e2e", "--update-snapshot", "--candidate"} <= (
+            {argv[argv.index("--candidate") + 1]} if "--candidate" in argv[:-1] else set()):
+        cmd_doctor(argv[2:])
+    elif argv[1:2] == ["even-proxy"] and argv[2:] in ([], ["--address"]):
+        cmd_even_proxy(print_address=argv[2:] == ["--address"])
+    elif len(argv) == 2 and argv[1] == "logs":
+        cmd_logs()
+    elif len(argv) == 4 and argv[1] in ("open", "attach") and sorted(argv[2:]).count("--revive") == 1:
+        cmd_open(next(a for a in argv[2:] if a != "--revive"), revive_forgotten=True)
+    elif len(argv) == 3 and argv[1] in ("open", "attach"):
+        cmd_open(argv[2])
+    elif len(argv) == 3 and argv[1] in ("reopen", "forget", "adopt"):
+        {"reopen": cmd_reopen, "forget": cmd_forget, "adopt": cmd_adopt}[argv[1]](argv[2])
+    elif len(argv) == 4 and argv[1] in ("reopen", "adopt") and sorted(argv[2:]).count("--revive") == 1:
+        key = next(a for a in argv[2:] if a != "--revive")
+        {"reopen": cmd_reopen, "adopt": cmd_adopt}[argv[1]](key, revive_forgotten=True)
+    elif argv[1:2] == ["retire"] and len(argv) <= 3:
+        cmd_retire(argv[2] if len(argv) == 3 else None)
+    elif argv[1:] in (["--version"], ["version"]):
+        print(f"afield {VERSION}")
+    elif argv[1:] == ["alert", "test"]:
+        if not ALERTS_URL:
+            sys.exit(f"alerts_url is not set: afield config set alerts_url https://...  (secret in {ALERTS_SECRET})")
+        status = send_alert("afield: test alert", "Contract failures will arrive here.")  # raises on failure
+        print(f"sent ({status})")
+    elif argv[1:2] == ["new"]:
+        cmd_new(" ".join(argv[2:]) or None)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

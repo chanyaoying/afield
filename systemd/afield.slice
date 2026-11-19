@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude Remote Control sessions (shared memory cap)
+
+[Slice]
+MemoryHigh=6G
+MemoryMax=8G

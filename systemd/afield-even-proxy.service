@@ -1,0 +1,22 @@
+[Unit]
+Description=afield glasses proxy: the Even G2 glasses list only afield's sessions, under their phone titles
+# Even Terminal listens on 127.0.0.1 only (install.sh: EVEN_HOST_MODE=interface, lo); this takes the
+# address the glasses use (network in ~/.even-terminal/config.json) and passes their requests on.
+After=even-terminal.service network-online.target
+Wants=network-online.target
+PartOf=afield.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Slice=afield.slice
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# With Even in Tailscale mode, wait until Tailscale has an IPv4 address.
+ExecStartPre=/bin/sh -c 'command -v tailscale >/dev/null || exit 0; for i in $(seq 1 60); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 2; done; echo "tailscale not ready" >&2; exit 1'
+ExecStart=/usr/bin/env python3 -I %h/.local/bin/afield even-proxy
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=afield.target

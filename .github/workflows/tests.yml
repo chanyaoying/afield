@@ -1,0 +1,37 @@
+name: tests
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * *"  # nightly: the static contracts against the newest Claude Code
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # one Python version failing should not hide the others' results
+      matrix:
+        python: ["3.10", "3.12", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 -I tests/test_afield.py
+      - run: python3 -I tests/test_contracts.py
+      - run: bash -n install.sh && bash -n uninstall.sh
+
+  contracts-latest-claude-code:
+    # Static checks only (flags in --help, names in the binary, on-screen text): no login needed.
+    # A failure here means the newest Claude Code changed something afield relies on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: npm install -g @evenrealities/even-terminal || echo "even-terminal unavailable; its checks skip"
+      - run: claude --version
+      - run: python3 -I bin/afield doctor --candidate "$(command -v claude)"

@@ -1,0 +1,19 @@
+[Unit]
+Description=tmux server holding one attached window per afield session (open with: afield)
+StartLimitIntervalSec=0
+PartOf=afield.target
+
+[Service]
+Type=forking
+Slice=afield.slice
+# PATH: install.sh adds the folders it found claude and even-terminal in (a drop-in, from the config).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/afield
+# Window 0 is a plain shell; the supervisor adds a window per session next to it.
+ExecStart=/usr/bin/env tmux -L afield new-session -d -s rc -n shell
+ExecStop=/usr/bin/env tmux -L afield kill-server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=afield.target

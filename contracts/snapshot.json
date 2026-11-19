@@ -1,0 +1,300 @@
+{
+ "observed": {
+  "API-1": {
+   "item": [
+    "active_mount_paths",
+    "configured_model",
+    "connection_status",
+    "created_at",
+    "environment_id",
+    "environment_kind",
+    "external_metadata",
+    "github_access",
+    "id",
+    "metadata",
+    "origin",
+    "permission_mode",
+    "session_context",
+    "session_status",
+    "session_url",
+    "status_bucket",
+    "tags",
+    "title",
+    "type",
+    "unread",
+    "updated_at"
+   ],
+   "top": [
+    "data",
+    "first_id",
+    "has_more",
+    "last_id"
+   ]
+  },
+  "API-2": {
+   "keys": [
+    "active_mount_paths",
+    "configured_model",
+    "connection_status",
+    "created_at",
+    "environment_id",
+    "environment_kind",
+    "external_metadata",
+    "github_access",
+    "id",
+    "metadata",
+    "origin",
+    "permission_mode",
+    "post_turn_summary",
+    "session_context",
+    "session_status",
+    "session_url",
+    "status_bucket",
+    "tags",
+    "title",
+    "type",
+    "unread",
+    "updated_at"
+   ]
+  },
+  "BIN-1": {
+   "found": [
+    "/v1/sessions",
+    "bridge-session",
+    "bridgeSessionId",
+    "ccr-byoc-2025-07-29",
+    "procStart",
+    "sdk-ts",
+    "sessionId",
+    "statusUpdatedAt"
+   ]
+  },
+  "CLI-1": {
+   "flags": [
+    "add-dir",
+    "agent",
+    "agents",
+    "all",
+    "allow-dangerously-skip-permissions",
+    "allowed",
+    "allowed-tools",
+    "append-system-prompt",
+    "autocompact",
+    "ax-screen-reader",
+    "background",
+    "bare",
+    "betas",
+    "bg",
+    "brief",
+    "chrome",
+    "cloud",
+    "continue",
+    "dangerously-skip-permissions",
+    "debug",
+    "debug-file",
+    "desktop",
+    "disable-slash-commands",
+    "disallowed",
+    "disallowed-tools",
+    "effort",
+    "environment",
+    "exclude-dynamic-system-prompt-sections",
+    "fallback-model",
+    "file",
+    "fork-session",
+    "forward-subagent-text",
+    "from-pr",
+    "help",
+    "ide",
+    "include-hook-events",
+    "include-partial-messages",
+    "input-format",
+    "json-schema",
+    "max-budget-usd",
+    "mcp-config",
+    "model",
+    "name",
+    "no-chrome",
+    "no-session-persistence",
+    "output-format",
+    "permission-mode",
+    "permission-prompt-tool",
+    "permission-prompts",
+    "plugin-dir",
+    "plugin-url",
+    "print",
+    "prompt-suggestions",
+    "remote-control",
+    "remote-control-session-name-prefix",
+    "replay-user-messages",
+    "restricted",
+    "resume",
+    "safe-mode",
+    "session-id",
+    "setting-sources",
+    "settings",
+    "strict-mcp-config",
+    "system-prompt",
+    "system-prompt-snapshot",
+    "teleport",
+    "tmux",
+    "tools",
+    "verbose",
+    "version",
+    "worktree"
+   ]
+  },
+  "CLI-2": {
+   "flags": [
+    "capacity",
+    "chrome",
+    "continue",
+    "create-session-in-dir",
+    "debug",
+    "debug-file",
+    "help",
+    "name",
+    "no-chrome",
+    "no-create-session-in-dir",
+    "permission-mode",
+    "remote-control-session-name-prefix",
+    "session-id",
+    "settings",
+    "spawn",
+    "verbose"
+   ]
+  },
+  "CRED-1": {
+   "keys": [
+    "accessToken",
+    "expiresAt",
+    "rateLimitTier",
+    "refreshToken",
+    "refreshTokenExpiresAt",
+    "scopes",
+    "subscriptionType",
+    "subscriptionTypeSource"
+   ]
+  },
+  "EVEN-1": {
+   "flags": [
+    "allow-cors",
+    "claude-allowed-tools",
+    "claude-use-system-cli",
+    "config",
+    "cwd",
+    "expose",
+    "help",
+    "if",
+    "interface",
+    "lan",
+    "log-file",
+    "log-level",
+    "name",
+    "port",
+    "provider",
+    "reset",
+    "resume",
+    "tailscale",
+    "token",
+    "use-original-claude",
+    "verbose",
+    "version"
+   ]
+  },
+  "EVEN-2": {
+   "files": [
+    "bin/cli.js",
+    "src/claude-sync/wrapper.mjs"
+   ]
+  },
+  "EVEN-3": {
+   "keys": [
+    "codexAppServerPort",
+    "cwd",
+    "pid",
+    "platform",
+    "port",
+    "startedAt",
+    "token"
+   ]
+  },
+  "EVEN-4": {
+   "found": [
+    "/api/claude-sync/hook",
+    "EVEN_HOST_INTERFACE",
+    "EVEN_HOST_MODE"
+   ]
+  },
+  "EVEN-5": {
+   "keys": [
+    "cwd",
+    "id",
+    "provider",
+    "status",
+    "timestamp",
+    "title"
+   ]
+  },
+  "SCREEN-1": {
+   "found": [
+    "Accessing workspace:",
+    "Yes, I trust this folder",
+    "esc to interrupt",
+    "remote-control is active",
+    "standing down",
+    "\u276f"
+   ]
+  },
+  "SCREEN-2": {
+   "found": [
+    "Also scan shell history",
+    "Esc to cancel",
+    "Teach auto mode about your environment?",
+    "[{label:\"Yes\",value:\"accept\"},{label:\"Not now\",value:\"later\"},{label:\"Don't show again\",value:\"dismiss\"}]"
+   ]
+  },
+  "SESS-1": {
+   "keys": [
+    "asksForConvertedSkills",
+    "cwd",
+    "entrypoint",
+    "kind",
+    "messagingSocketPath",
+    "name",
+    "nameSince",
+    "nameSource",
+    "peerFeatures",
+    "peerProtocol",
+    "pid",
+    "pidDomain",
+    "procStart",
+    "sessionId",
+    "startedAt",
+    "status",
+    "statusUpdatedAt",
+    "tmux",
+    "updatedAt",
+    "version"
+   ]
+  },
+  "TMUX-1": {
+   "version": "tmux 3.6"
+  },
+  "TRANS-2": {
+   "keys": [
+    "bridgeSessionId",
+    "lastSequenceNum",
+    "ownerAccountUuid",
+    "ownerOrganizationUuid",
+    "sessionId",
+    "type"
+   ]
+  }
+ },
+ "versions": {
+  "claude": "2.1.328",
+  "even-terminal": "0.10.5",
+  "tmux": "3.6"
+ }
+}

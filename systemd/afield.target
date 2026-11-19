@@ -1,0 +1,7 @@
+[Unit]
+Description=afield: Claude Code sessions in sync across terminal, phone and (optionally) Even G2 glasses
+# Start, stop or restart everything at once: systemctl --user start|stop|restart afield.target
+# Stopping it stops every session (they come back on their phone links when it starts again).
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Claude Code Remote Control server (new sessions from the phone)
+After=network-online.target
+Wants=network-online.target
+PartOf=afield.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Slice=afield.slice
+# PATH: install.sh adds the folders it found claude and even-terminal in (a drop-in, from the config).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/afield
+# No --continue: it forces single-session mode, so the phone cannot start new sessions.
+# --no-create-session-in-dir: no server-owned session. The server reattaches its own session on
+# restart and that rewrote a converted session's transcript, so every chat is a phone-started
+# one that the supervisor converts. After switching modes the server may report "folder already
+# served" until the old session's lease expires; Restart= retries until then.
+# --no-create-session-in-dir: see README "Verified behaviour". contract: CLI-2
+ExecStart=/usr/bin/env claude remote-control --no-create-session-in-dir
+Restart=always
+RestartSec=10
+OOMPolicy=continue
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=afield.target
