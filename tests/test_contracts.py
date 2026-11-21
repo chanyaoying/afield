@@ -10,6 +10,7 @@ import glob
 import importlib.machinery
 import importlib.util
 import json
+import time
 import os
 import re
 import sys
@@ -208,6 +209,29 @@ class StaticChecks(unittest.TestCase):
         self.assertEqual(r["status"], c.FAIL)
         self.assertIn("Not now", r["detail"][0])
         self.assertEqual(c.blocking([r]), [])  # reported, but nothing else pauses
+
+
+class LoginCheck(unittest.TestCase):
+    def check(self, info):
+        with Patched(read_login=lambda claude="claude": info):
+            return c.check_login(c.Ctx(rc))
+
+    def stamp(self, days):
+        return rc.datetime.fromtimestamp(time.time() + days * 86400, rc.timezone.utc).isoformat()
+
+    def test_far_away_passes_and_shows_the_date(self):
+        r = self.check({"loggedIn": True, "email": "someone@example.com", "loginExpiresAt": self.stamp(20)})
+        self.assertEqual(r["status"], c.OK)
+        self.assertIn("login ends", r["note"][0])
+        self.assertNotIn("example.com", json.dumps(r))  # key names only
+        self.assertIn("email", r["observed"]["keys"])
+
+    def test_close_signed_out_or_reshaped_fails_without_pausing(self):
+        for info in ({"loggedIn": True, "loginExpiresAt": self.stamp(1)}, {"loggedIn": False},
+                     {"loggedIn": True, "expires": "x"}, None):
+            r = self.check(info)
+            self.assertEqual(r["status"], c.FAIL, info)
+            self.assertEqual(c.blocking([r]), [])
 
 
 class CredentialsOnlyWhenUsed(unittest.TestCase):

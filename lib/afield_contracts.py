@@ -148,7 +148,7 @@ def format_report(results, versions, registry=None, candidate=False):
     for r in results:
         c = registry.get(r["id"], {})
         lines.append(f"{r['status']:8} {r['id']:8} {c.get('title', '')}")
-        show = r.get("detail", []) if r["status"] != OK else []
+        show = r.get("detail", []) if r["status"] != OK else r.get("note", [])
         for line in show[:12]:
             lines.append(f"{'':17}{line}")
         if len(show) > 12:
@@ -533,6 +533,24 @@ def check_credentials(ctx):
     ok = isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str) and oauth["accessToken"]
     return result("CRED-1", OK if ok else FAIL, [] if ok else ["no claudeAiOauth.accessToken"],
                   {"keys": sorted(oauth) if isinstance(oauth, dict) else []})  # names only, never values
+
+
+@contract("AUTH-1", "live", "`claude auth status --json` says when the Claude login ends, and that is over 3 days away",
+          ["read_login", "login_status", "login_words"], critical=False)
+def check_login(ctx):
+    # Not critical: nothing afield does depends on the date, but every session stops when the
+    # login ends, so the warning goes out through the contract alerts.
+    info = ctx.rc.read_login(ctx.claude)
+    if not isinstance(info, dict):
+        return result("AUTH-1", FAIL, ["`claude auth status --json` did not print JSON"])
+    observed = {"keys": sorted(info)}  # names only: the values include your email
+    if "loggedIn" not in info or (info.get("loggedIn") and "loginExpiresAt" not in info):
+        return result("AUTH-1", FAIL, ["no loggedIn/loginExpiresAt in `claude auth status --json`"], observed)
+    state, ends = ctx.rc.login_status(info, time.time())
+    words = [f"login {ctx.rc.login_words(state, ends)}"]
+    if state == "ok":
+        return dict(result("AUTH-1", OK, [], observed), note=words)
+    return result("AUTH-1", FAIL, words, observed)
 
 
 KNOWN_API_STATUSES = {"idle", "running", "requires_action", "archived", "completed", "failed"}

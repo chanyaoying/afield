@@ -4,6 +4,10 @@ All notable changes. Versions follow [semantic versioning](https://semver.org) f
 
 ## Unreleased
 
+- Added: `afield status` and `afield doctor` show when your Claude login ends (from
+  `claude auth status`). New contract AUTH-1 fails, and so sends an alert, when under 3 days are
+  left, since every session stops when the login ends. It pauses nothing.
+
 ## v0.1.0 (2026-11-19)
 
 First release. Changes since the first import (2026-11-09):

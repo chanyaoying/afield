@@ -70,7 +70,7 @@ import threading
 import time
 import uuid as uuid_mod
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 VERSION = "0.1.0"
 HOME = os.path.expanduser("~")
@@ -926,6 +926,53 @@ def parse_time(stamp):
         return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
     except (AttributeError, ValueError):
         return None
+
+
+LOGIN_WARN_SECONDS = 3 * 86400  # warn this long before the Claude login ends
+
+
+def read_login(claude="claude"):
+    """`claude auth status --json` as a dict, or None. It also holds your email: keep only what
+    login_status() uses, never print or store the rest."""
+    try:
+        out = subprocess.run([claude, "auth", "status", "--json"], capture_output=True, text=True,
+                             timeout=30)  # contract: AUTH-1
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def login_status(info, now):
+    """(state, ends_at) for the Claude login every session and the phone link run on. state is
+    ok, soon (under 3 days left), ended, signed_out or unknown. A login ends on a fixed date
+    (loginExpiresAt); refreshing the token does not move it, only `claude auth login` does."""
+    if not isinstance(info, dict):
+        return "unknown", None
+    if not info.get("loggedIn"):  # contract: AUTH-1
+        return "signed_out", None
+    ends = parse_time(info.get("loginExpiresAt"))  # contract: AUTH-1
+    if ends is None:
+        return "unknown", None
+    if ends <= now:
+        return "ended", ends
+    return ("soon" if ends - now < LOGIN_WARN_SECONDS else "ok"), ends
+
+
+def login_words(state, ends, now=None):
+    """One line for status and doctor. Without `now` it has no countdown, so it stays the same
+    from run to run (a contract alert is sent again only when its text changes)."""
+    when = datetime.fromtimestamp(ends, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ends else None
+    left = ""
+    if ends and now is not None and ends > now:
+        hours = int((ends - now) // 3600)
+        left = f" (in {hours // 24} d {hours % 24} h)" if hours >= 24 else f" (in {hours} h)"
+    return {
+        "ok": f"ends {when}{left}",
+        "soon": f"ends {when}{left}: run `claude auth login` before then",
+        "ended": f"ended {when}: run `claude auth login`",
+        "signed_out": "signed out: run `claude auth login`",
+        "unknown": "end date unknown (`claude auth status --json` gave no loginExpiresAt)",
+    }[state]
 
 
 API_ROOT = "https://api.anthropic.com"
@@ -1978,6 +2025,7 @@ def status_report(now=None):
     health = read_server_health()
     server_ok, server_words = server_health(state[SERVER_UNIT], health.get("restarts", []), now)
     saved = saved_contracts()
+    login_state, login_ends = login_status(read_login(), now)
     glasses = None
     if even_expected(shown.get(EVEN_UNIT, {})):
         even_ok, even_words = even_health(health.get("even_restarts", []), now)
@@ -1991,6 +2039,7 @@ def status_report(now=None):
         "memory": {"used_bytes": slice_memory(), "max_bytes": MEMORY_MAX_BYTES, "defer_above_bytes": DEFER_ABOVE_BYTES},
         "sessions": {"running": len(hosted), "kept_open": sum(1 for e in registry.values() if e["state"] == "open"),
                      "max_open": MAX_OPEN},
+        "login": {"state": login_state, "ends_at": login_ends, "summary": login_words(login_state, login_ends, now)},
         "contracts": {"line": contracts_line(saved, now), "blocking": (saved or {}).get("blocking", []),
                       "ran_at": (saved or {}).get("ran_at")},
         "config": {"path": CONFIG_PATH, "problems": CONFIG_PROBLEMS,
@@ -2027,6 +2076,7 @@ def cmd_status(as_json=False):
     print(f"sessions    {n['running']} running, {n['kept_open']} kept open, at most {n['max_open']} at once")
     api = [name for name, on in (("archive sync", ARCHIVE_SYNC), ("phone titles", PHONE_TITLES)) if on]
     print(f"phone API   {', '.join(api) + ' on' if api else 'off'} (config: archive_sync, phone_titles)")
+    print(f"login       {'' if r['login']['state'] == 'ok' else 'WARNING: '}{r['login']['summary']}")
     print(f"contracts   {r['contracts']['line']}")
     for problem in r["config"]["problems"]:
         print(f"config      {problem} ({CONFIG_PATH})")
@@ -2114,7 +2164,9 @@ def contracts_line(saved, now):
         return (f"FAILED {', '.join(saved['blocking'])}: moving, adopting, archive sync and link writes "
                 f"paused · afield doctor")
     extra = "".join(f", {counts[k]} {k}" for k in ("changed", "skip") if counts.get(k))
-    return f"ok ({counts.get('ok', 0)} pass{extra}) · {seen} · checked {ago} min ago"
+    failed = [r["id"] for r in saved.get("results", []) if r["status"] == "FAIL"]
+    head = f"WARNING: {', '.join(failed)} failed (pauses nothing) · afield doctor" if failed else "ok"
+    return f"{head} ({counts.get('ok', 0)} pass{extra}) · {seen} · checked {ago} min ago"
 
 
 def cmd_doctor(args):

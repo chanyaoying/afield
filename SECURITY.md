@@ -14,6 +14,10 @@ undocumented sessions API. All three are off by default; then afield never opens
 never logs or prints the token. Using it from a tool other than Claude Code may not be allowed by
 the terms for your account: at your own risk (see the README).
 
+To warn you before your login ends, `afield status`, `afield doctor` and the supervisor (every
+6 h) run `claude auth status --json` and keep only `loggedIn` and `loginExpiresAt`. That output
+also holds your email; afield never prints, logs or stores it.
+
 **Your transcripts.** It appends one `bridge-session` line to a session's transcript when it moves
 a phone chat into a window, so the window reuses the chat's phone link. It never changes or
 removes existing lines.

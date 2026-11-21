@@ -1267,6 +1267,41 @@ class ContractAlerts(unittest.TestCase):
         self.assertNotIn("secret-path", text)
 
 
+class LoginExpiry(unittest.TestCase):
+    NOW = 1795000000.0  # 2026-11-18 11:06:40 UTC
+
+    def info(self, days):
+        stamp = rc.datetime.fromtimestamp(self.NOW + days * 86400, rc.timezone.utc).isoformat().replace("+00:00", "Z")
+        return {"loggedIn": True, "email": "someone@example.com", "loginExpiresAt": stamp}
+
+    def test_states(self):
+        self.assertEqual(rc.login_status(self.info(5), self.NOW)[0], "ok")
+        self.assertEqual(rc.login_status(self.info(2.9), self.NOW)[0], "soon")
+        self.assertEqual(rc.login_status(self.info(-1), self.NOW)[0], "ended")
+        self.assertEqual(rc.login_status({"loggedIn": False}, self.NOW), ("signed_out", None))
+        self.assertEqual(rc.login_status(None, self.NOW), ("unknown", None))
+        self.assertEqual(rc.login_status({"loggedIn": True}, self.NOW), ("unknown", None))
+
+    def test_words(self):
+        state, ends = rc.login_status(self.info(2.5), self.NOW)
+        self.assertEqual(rc.login_words(state, ends, self.NOW),
+                         "ends 2026-11-20 23:06 UTC (in 2 d 12 h): run `claude auth login` before then")
+        # without now there is no countdown, so a repeated alert has the same text
+        self.assertEqual(rc.login_words(state, ends), rc.login_words(state, ends))
+        self.assertNotIn("(in", rc.login_words(state, ends))
+        self.assertNotIn("example.com", rc.login_words(state, ends, self.NOW))
+
+    def test_status_line_names_a_failure_that_pauses_nothing(self):
+        saved = {"ran_at": self.NOW, "versions": {}, "blocking": [],
+                 "results": [{"id": "AUTH-1", "status": "FAIL"}, {"id": "CLI-1", "status": "ok"}]}
+        self.assertTrue(rc.contracts_line(saved, self.NOW).startswith("WARNING: AUTH-1 failed (pauses nothing)"))
+        saved["results"][0]["status"] = "ok"
+        self.assertTrue(rc.contracts_line(saved, self.NOW).startswith("ok (2 pass)"))
+
+    def test_read_login_survives_a_missing_binary(self):
+        self.assertIsNone(rc.read_login("/nonexistent/claude"))
+
+
 class NewTitle(unittest.TestCase):
     def test_a_title_that_looks_like_a_flag_is_refused(self):
         # the title is passed to claude after the flags; "-p x" would turn into a flag

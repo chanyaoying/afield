@@ -121,6 +121,7 @@ The unit tests enforce all of these except the fake.
 | TRANS-3 | live | transcripts record their entrypoint; glasses chats are `sdk-ts` |
 | TRANS-4 | live | transcripts are compact JSON |
 | CRED-1 | live | where the OAuth token is |
+| AUTH-1 | live | when the Claude login ends (warns 3 days ahead; pauses nothing) |
 | API-1 | live | the shape of `GET /v1/sessions` |
 | API-2 | live | the shape of `GET /v1/sessions/<link>` |
 | EVEN-3 | live | Even's instance file |
@@ -290,6 +291,19 @@ config (both off by default). While one is off, its check (API-1 / API-2) is ski
 `api_request()` sends it as a Bearer token. The check never prints the token, only key names.
 **If it breaks:** titles stop updating and archive sync stops; everything else works.
 **Check:** `check_credentials`.
+
+### AUTH-1
+
+**Assumption:** `claude auth status --json` prints JSON with `loggedIn` (true/false) and, when
+signed in, `loginExpiresAt` (ISO time). That is the fixed date the Claude login ends: refreshing the
+token does not move it, only `claude auth login` does. afield reads only those two fields; the
+output also holds your email, which is never printed or stored (the snapshot keeps key names).
+Why afield cares: every session and the phone link run on that login, so all of them stop when it
+ends. `afield status` shows a `login` line, and `afield doctor` shows the end date.
+**Fails when:** the fields are missing, you are signed out, or under 3 days are left. The failure
+goes out through the contract alerts (`alerts_url`) once, with the date.
+**Not critical:** nothing is paused; afield's actions do not depend on the date.
+**Check:** `check_login`.
 
 ### API-1
 
