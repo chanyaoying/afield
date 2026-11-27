@@ -4,6 +4,13 @@ All notable changes. Versions follow [semantic versioning](https://semver.org) f
 
 ## Unreleased
 
+- Fixed: a chat branched off with a slash command can start as a Claude Code background session
+  (`claude daemon`), outside afield's windows. afield showed it as "open elsewhere", and because it
+  has no phone-link line in its transcript TRANS-2 failed, which paused moving, adoption and archive
+  sync (for 42 hours on 2026-11-25). TRANS-2 now checks only sessions running in afield's windows,
+  and the supervisor moves an idle background session into a window like a phone chat
+  (`claude stop`, `claude rm`, then resume on its phone link). New contract SESS-3 (pauses nothing).
+
 - Added: `afield status` and `afield doctor` show when your Claude login ends (from
   `claude auth status`). New contract AUTH-1 fails, and so sends an alert, when under 3 days are
   left, since every session stops when the login ends. It pauses nothing.

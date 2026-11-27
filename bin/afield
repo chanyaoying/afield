@@ -267,7 +267,6 @@ REGISTRY = f"{STATE_DIR}/registry.json"
 LOCK = f"{STATE_DIR}/registry.lock"
 
 SERVER_UNIT = os.environ.get("AFIELD_SERVER_UNIT", "afield.service")
-DAEMON_UNIT = "claude-rc-daemon.service"  # earlier version; only migrated away from now
 SLICE = "afield.slice"
 TMUX_UNIT = "afield-tmux.service"
 TMUX = ["tmux", "-L", os.environ.get("AFIELD_TMUX", "afield")]
@@ -387,14 +386,16 @@ def should_adopt(t, now, since, tracked, live, min_idle):
             and t["created"] >= since and now - t["mtime"] >= min_idle)
 
 
-def classify(ancestors, panes, cgroup):
-    """ancestors: the pid and its parents; panes: {pane pid: @afield_uuid or ""}."""
+def classify(ancestors, panes, cgroup, kind=None):
+    """ancestors: the pid and its parents; panes: {pane pid: @afield_uuid or ""}; kind: the session
+    file's kind. "daemon" is a Claude Code background session (`kind: "bg"`, run by `claude daemon`,
+    e.g. a chat branched off with a slash command): it is moved into a window like a phone chat."""
     for pid in ancestors:
         if pid in panes:
             return "tmux" if panes[pid] else "external"
     if SERVER_UNIT in cgroup:  # contract: PROC-1
         return "server"
-    if DAEMON_UNIT in cgroup:
+    if kind == "bg":  # contract: SESS-3
         return "daemon"
     return "external"
 
@@ -805,7 +806,7 @@ def live_processes(panes):
         procs.append(dict(
             pid=pid, uuid=data["sessionId"], cwd=data.get("cwd"), name=data.get("name"),
             status=data.get("status"), status_at=data.get("statusUpdatedAt"),
-            link=data.get("bridgeSessionId"), host=classify(ancestors(pid), panes, cgroup_of(pid)),
+            link=data.get("bridgeSessionId"), host=classify(ancestors(pid), panes, cgroup_of(pid), data.get("kind")),
         ))
     return procs
 
@@ -1585,10 +1586,10 @@ def wait_gone(pid, seconds=15):
 
 
 def stop_process(proc):
-    """Stop a headless server child or an old background job so its window can take over."""
+    """Stop a headless server child or a Claude Code background session so its window can take over."""
     if proc["host"] == "daemon":
         short = proc["uuid"][:8]
-        subprocess.run(["claude", "stop", short], capture_output=True, timeout=60)
+        subprocess.run(["claude", "stop", short], capture_output=True, timeout=60)  # contract: SESS-3
         gone = wait_gone(proc["pid"])
         if gone:  # the job record would otherwise refuse `claude --resume` (tested)
             subprocess.run(["claude", "rm", short], capture_output=True, timeout=60)
@@ -1919,7 +1920,7 @@ def describe(proc, entry, running=0, limit=MAX_OPEN):
     if proc["host"] == "tmux":
         where = "terminal+phone+glasses" if entry.get("wrapped", True) else "terminal+phone"
     else:
-        where = {"server": "phone (moving to terminal)", "daemon": "old bg job (moving)",
+        where = {"server": "phone (moving to terminal)", "daemon": "background session (moving to terminal)",
                  "external": "open elsewhere"}[proc["host"]]
     if proc["host"] == "tmux" and entry.get("link") and not proc.get("link"):
         where = "terminal+glasses, PHONE DISCONNECTED" if entry.get("wrapped", True) else "terminal, PHONE DISCONNECTED"

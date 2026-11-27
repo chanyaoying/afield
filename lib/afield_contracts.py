@@ -424,12 +424,32 @@ def check_proc_start(ctx):
 
 
 def tracked_live(ctx):
-    """Open registry sessions that are running in an afield window and have a phone link. A phone
-    chat still hosted by the Remote Control server is left out: the server writes no bridge-session
-    line (only a window's --remote-control does), so TRANS-2 failed on every busy one (2026-11-10)."""
+    """Open registry sessions that are running in an afield window and have a phone link. Only a
+    window's --remote-control writes a bridge-session line, so anything else is left out: a phone
+    chat still on the Remote Control server (TRANS-2 failed on every busy one, 2026-11-10) and a
+    Claude Code background session (a branched chat paused afield for 42 h, 2026-11-25). Where it
+    runs is read from the process tree, not from the registry, which can be out of date."""
     live = {r["sessionId"]: r for _p, r in session_files(ctx.rc)}
+    try:
+        windowed = {p["uuid"] for p in ctx.rc.live_processes(ctx.rc.pane_map(ctx.rc.tmux_panes()))
+                    if p["host"] == "tmux"}
+    except Exception:
+        windowed = set()  # tmux unreadable: TMUX-1 reports that; a guess here could pause afield
     return [(e, live[u]) for u, e in ctx.rc.load().items()
-            if e.get("state") == "open" and e.get("link") and u in live and e.get("host") != "server"]
+            if e.get("state") == "open" and e.get("link") and u in live and u in windowed]
+
+
+@contract("SESS-3", "live", "a Claude Code background session's file has kind \"bg\"; `claude stop` and `claude rm` "
+          "stop and remove one", ["classify", "stop_process"], critical=False)
+def check_background_sessions(ctx):
+    # Not critical: if it breaks, a background session is just left where it is ("open elsewhere").
+    problems = []
+    for sub, words in (("stop", "background session"), ("rm", "background session")):
+        text = ctx.help(sub)
+        if f"claude {sub} <id>" not in text or words not in text:
+            problems.append(f"`claude {sub} --help` no longer reads 'claude {sub} <id>' ... '{words}'")
+    kinds = sorted({str(r.get("kind")) for _p, r in session_files(ctx.rc)})  # a new kind shows as "changed"
+    return result("SESS-3", FAIL if problems else OK, problems, {"kinds": kinds})
 
 
 @contract("TRANS-1", "live", "a transcript lives at projects/<cwd, non-alphanumerics as '-'>/<uuid>.jsonl",

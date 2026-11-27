@@ -234,6 +234,26 @@ class LoginCheck(unittest.TestCase):
             self.assertEqual(c.blocking([r]), [])
 
 
+class BackgroundSessionCheck(unittest.TestCase):
+    def ctx(self, stop_help):
+        ctx = c.Ctx(rc)
+        ctx._help[(ctx.claude, "stop")] = stop_help
+        ctx._help[(ctx.claude, "rm")] = "Usage: claude rm <id>\n  remove a background session from the list"
+        return ctx
+
+    def test_stop_and_rm_as_expected(self):
+        with Patched(SESSIONS_DIR=tempfile.mkdtemp()):
+            r = c.check_background_sessions(self.ctx("Usage: claude stop <id>\n  Stop a background session."))
+        self.assertEqual(r["status"], c.OK)
+
+    def test_renamed_stop_fails_without_pausing(self):
+        with Patched(SESSIONS_DIR=tempfile.mkdtemp()):
+            r = c.check_background_sessions(self.ctx("Usage: claude bg kill <id>"))
+        self.assertEqual(r["status"], c.FAIL)
+        self.assertIn("claude stop", r["detail"][0])
+        self.assertEqual(c.blocking([r]), [])
+
+
 class CredentialsOnlyWhenUsed(unittest.TestCase):
     def test_token_file_is_not_read_while_nothing_uses_it(self):
         with Patched(ARCHIVE_SYNC=False, PHONE_TITLES=False, RETIRE_ARCHIVES=False,
@@ -305,6 +325,7 @@ class TranscriptChecks(unittest.TestCase):
             json.dump({"pid": os.getpid(), "procStart": own_proc_start(), "sessionId": self.uuid, "cwd": self.cwd,
                        "status": "idle", "statusUpdatedAt": 1, "bridgeSessionId": "session_XYZ"}, fh)
         self.registry = {self.uuid: {"uuid": self.uuid, "state": "open", "link": "session_XYZ", "cwd": self.cwd}}
+        self.host = "tmux"  # where the process tree says the session runs
 
     def transcript(self, *lines):
         with Patched(PROJECTS_DIR=self.projects):
@@ -314,7 +335,9 @@ class TranscriptChecks(unittest.TestCase):
             fh.write("\n".join(lines) + "\n")
 
     def check(self, fn):
-        with Patched(SESSIONS_DIR=self.sessions, PROJECTS_DIR=self.projects, load=lambda: self.registry):
+        with Patched(SESSIONS_DIR=self.sessions, PROJECTS_DIR=self.projects, load=lambda: self.registry,
+                     tmux_panes=lambda: [], pane_map=lambda panes: {},
+                     live_processes=lambda panes: [{"uuid": self.uuid, "host": self.host}]):
             return fn(c.Ctx(rc))
 
     def test_path_encoding(self):
@@ -340,7 +363,15 @@ class TranscriptChecks(unittest.TestCase):
 
     def test_phone_chat_still_on_the_server_is_not_checked(self):
         # The server writes no bridge-session line; only a window's --remote-control does.
-        self.registry[self.uuid]["host"] = "server"
+        self.host = "server"
+        self.transcript('{"type":"user"}')
+        self.assertEqual(self.check(c.check_bridge_line)["status"], c.SKIP)
+
+    def test_background_session_is_not_checked_even_if_the_registry_says_window(self):
+        # 2026-11-25: a branched chat ran as a Claude Code background session while the registry
+        # still said tmux; its missing bridge-session line failed TRANS-2 and paused afield for 42 h.
+        self.registry[self.uuid]["host"] = "tmux"
+        self.host = "daemon"
         self.transcript('{"type":"user"}')
         self.assertEqual(self.check(c.check_bridge_line)["status"], c.SKIP)
 

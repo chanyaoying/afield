@@ -231,7 +231,9 @@ class Host(unittest.TestCase):
         self.assertEqual(rc.classify([300, 1], self.PANES, "0::/x/afield.service"), "server")
 
     def test_old_background_session_by_cgroup(self):
-        self.assertEqual(rc.classify([300, 1], self.PANES, "0::/x/claude-rc-daemon.service"), "daemon")
+        # a Claude Code background session (claude daemon), e.g. a chat branched with a slash command
+        self.assertEqual(rc.classify([300, 1], self.PANES, "0::/x/tmux-spawn-1.scope", "bg"), "daemon")
+        self.assertEqual(rc.classify([300, 1], self.PANES, "0::/x/tmux-spawn-1.scope", "interactive"), "external")
 
 
 class Windows(unittest.TestCase):

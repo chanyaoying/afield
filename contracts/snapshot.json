@@ -9,11 +9,11 @@
     "environment_id",
     "environment_kind",
     "external_metadata",
+    "foreground_active",
     "github_access",
     "id",
     "metadata",
     "origin",
-    "permission_mode",
     "session_context",
     "session_status",
     "session_url",
@@ -40,6 +40,7 @@
     "environment_id",
     "environment_kind",
     "external_metadata",
+    "foreground_active",
     "github_access",
     "id",
     "metadata",
@@ -55,6 +56,24 @@
     "type",
     "unread",
     "updated_at"
+   ]
+  },
+  "AUTH-1": {
+   "keys": [
+    "analyticsDisabled",
+    "apiProvider",
+    "authMethod",
+    "configDirectory",
+    "consoleProfileSignInOffered",
+    "email",
+    "loggedIn",
+    "loginExpiresAt",
+    "orgId",
+    "orgName",
+    "planTier",
+    "projectsDirectory",
+    "storedClaudeAiLogin",
+    "subscriptionType"
    ]
   },
   "BIN-1": {
@@ -167,7 +186,9 @@
   "CRED-1": {
    "keys": [
     "accessToken",
+    "accountUuid",
     "expiresAt",
+    "organizationUuid",
     "rateLimitTier",
     "refreshToken",
     "refreshTokenExpiresAt",
@@ -278,6 +299,11 @@
     "version"
    ]
   },
+  "SESS-3": {
+   "kinds": [
+    "interactive"
+   ]
+  },
   "TMUX-1": {
    "version": "tmux 3.6"
   },
@@ -293,7 +319,7 @@
   }
  },
  "versions": {
-  "claude": "2.1.328",
+  "claude": "2.1.332",
   "even-terminal": "0.10.5",
   "tmux": "3.6"
  }

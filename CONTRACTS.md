@@ -116,6 +116,7 @@ The unit tests enforce all of these except the fake.
 | EVEN-2 | static | Even's wrapper reads `EVEN_TERMINAL_PORT` |
 | SESS-1 | live | session files have the fields and types afield reads |
 | SESS-2 | live | `procStart` equals the process start time in `/proc/<pid>/stat` |
+| SESS-3 | live | Claude Code background sessions (`kind: "bg"`) and `claude stop`/`claude rm` (pauses nothing) |
 | TRANS-1 | live | where a transcript file lives |
 | TRANS-2 | live | the last `bridge-session` line picks the phone link |
 | TRANS-3 | live | transcripts record their entrypoint; glasses chats are `sdk-ts` |
@@ -235,6 +236,21 @@ uses it to ignore stale files whose PID was reused.
 
 ## Transcripts (`~/.claude/projects/<encoded cwd>/<uuid>.jsonl`)
 
+### SESS-3
+
+**Assumption:** a Claude Code background session (run by `claude daemon`; a chat branched off
+with a slash command can start as one) has `"kind": "bg"` in its session file, where windows
+have `"interactive"`. `claude stop <id>` stops one and keeps its conversation; `claude rm <id>`
+removes it from the list (without that, `claude --resume` of it is refused).
+Why afield cares: such a chat runs outside afield's windows, so it is not on the glasses or in
+the terminal. `classify()` calls it `daemon`, and the supervisor moves it into a window once it
+is idle, like a phone chat: `stop_process()` stops and removes it, then the window resumes it on
+its phone link. Before this (2026-11-25) a branched chat was "open elsewhere" for 42 h and its
+missing bridge-session line failed TRANS-2, which paused afield.
+**If it breaks:** background sessions are left where they are ("open elsewhere"); nothing else.
+**Not critical:** a failure is reported but pauses nothing. A new `kind` value shows as changed.
+**Check:** `check_background_sessions` (both `--help` texts, and the kinds seen).
+
 ### TRANS-1
 
 **Assumption:** a session's transcript is `~/.claude/projects/<cwd with every non-alphanumeric
@@ -257,7 +273,9 @@ writes only the three fields above, and resume accepts that.
 **If it breaks:** moved and reopened sessions appear on the phone as *new* chats, and the old
 entries go stale.
 **Check:** `check_bridge_line`, against every running tracked session in a window (a phone chat
-still hosted by the Remote Control server has no bridge-session line until it moves). E2E-1 and E2E-2 test the
+still hosted by the Remote Control server, or a Claude Code background session, has no
+bridge-session line until it moves; where a session runs is read from the process tree, not the
+registry). E2E-1 and E2E-2 test the
 behaviour end to end.
 
 ### TRANS-3
